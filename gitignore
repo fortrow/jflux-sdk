@@ -1,0 +1,202 @@
+# ==============================================================================
+# OPERATING SYSTEMS
+# ==============================================================================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V180
+.Trashes
+.fseventsd
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.trash*
+.trash-*
+.nfs*
+
+# ==============================================================================
+# IDES & EDITORS
+# ==============================================================================
+# JetBrains (IntelliJ, PyCharm, WebStorm, CLion, etc.)
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# Visual Studio Code
+.vscode/
+.history/
+.ionide/
+*.code-workspace
+
+# Visual Studio
+.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.opendb
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# ==============================================================================
+# PROGRAMMING LANGUAGES
+# ==============================================================================
+# Node.js / JavaScript / TypeScript
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.npm/
+.yarn/
+.eslintcache
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+htmlcov/
+.tox/
+.pytest_cache/
+.coverage
+.coverage.*
+*.cover
+*.gpickle
+.hypothesis/
+.cache/
+
+# Java / JVM (Gradle & Maven)
+build/
+.gradle/
+target/
+*.class
+*.log
+.mtj.tmp/
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+hs_err_pid*
+
+# C# / .NET
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.csproj.user
+
+# C++
+*.o
+*.obj
+*.d
+*.pch
+*.idb
+*.ilk
+*.exp
+*.lib
+*.a
+*.la
+*.lo
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+*.app
+
+# PHP / Composer
+vendor/
+composer.lock
+composer.phar
+
+# Go
+bin/
+*.exe
+*.exe~
+*.so
+*.dylib
+*.dll
+*.test
+*.prof
+cover.out
+
+# Ruby
+.bundle
+vendor/bundle
+log/
+tmp/
+*.swp
+*~
+.sass-cache/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# ==============================================================================
+# SECRETS & ENVIRONMENT
+# ==============================================================================
+.env
+.env.local
+.env.*.local
+secret.json
+credentials.json
+
+.venv-mps/
+.venv/
+*.pt

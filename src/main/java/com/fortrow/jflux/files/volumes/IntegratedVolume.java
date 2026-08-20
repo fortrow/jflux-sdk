@@ -1,0 +1,129 @@
+/*
+ * -------------------------------------------------------------------------
+ * 
+ * Copyright (c) 2026 Fortrow LLC. All rights reserved.
+ *  
+ * NOTICE: All information contained herein is, and remains the property of 
+ * Fortrow, LLC. The intellectual and technical concepts contained herein are 
+ * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
+ * patents in process, and are protected by trade secret or copyright law.
+ * 
+ * Dissemination of this information or reproduction of this material is 
+ * strictly forbidden unless prior written permission is obtained from 
+ * Fortrow, LLC.
+ * 
+ * -------------------------------------------------------------------------
+ * 
+ * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-05 12:03:56 EDT
+ * 
+ * -------------------------------------------------------------------------
+
+ */
+package com.fortrow.jflux.files.volumes;
+
+import com.fortrow.jflux.exceptions.types.CommonIOException;
+import com.fortrow.jflux.files.volumes.supporting.VolumeImpl;
+import com.fortrow.jflux.files.volumes.supporting.VolumeStatus;
+import com.fortrow.jflux.shell.Run;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+public class IntegratedVolume implements VolumeImpl {
+
+    private final String device;
+    private final String mountPoint;
+
+    public IntegratedVolume(String device, String mountPoint) {
+        this.device = device;
+        this.mountPoint = mountPoint;
+    }
+
+    @Override
+    public VolumeStatus mountWindows() throws CommonIOException {
+        if (isMountedWindows()) return VolumeStatus.MOUNTED;
+
+        int status = Run.Windows.waitForStatus("mountvol " + windowsQuote(mountPoint) + " " + windowsQuote(device));
+        return status == 0 ? VolumeStatus.MOUNTED : VolumeStatus.NO_EXISTS;
+    }
+
+    @Override
+    public VolumeStatus mountMac() throws CommonIOException {
+        if (!exists(device)) return VolumeStatus.NO_EXISTS;
+        if (isMountedMac()) return VolumeStatus.MOUNTED;
+
+        ensureMountPoint();
+        int status = Run.Mac.waitForStatus("diskutil mount -mountPoint " + unixQuote(mountPoint) + " " + unixQuote(device));
+        return status == 0 || isMountedMac() ? VolumeStatus.MOUNTED : VolumeStatus.UNMOUNTED;
+    }
+
+    @Override
+    public VolumeStatus mountLinux() throws CommonIOException {
+        if (!exists(device)) return VolumeStatus.NO_EXISTS;
+        if (isMountedLinux()) return VolumeStatus.MOUNTED;
+
+        ensureMountPoint();
+        int status = Run.Linux.waitForStatus("mount " + unixQuote(device) + " " + unixQuote(mountPoint));
+        return status == 0 || isMountedLinux() ? VolumeStatus.MOUNTED : VolumeStatus.UNMOUNTED;
+    }
+
+    @Override
+    public VolumeStatus umountWindows() throws CommonIOException {
+        if (!isMountedWindows()) return VolumeStatus.UNMOUNTED;
+
+        int status = Run.Windows.waitForStatus("mountvol " + windowsQuote(mountPoint) + " /D");
+        return status == 0 || !isMountedWindows() ? VolumeStatus.UNMOUNTED : VolumeStatus.MOUNTED;
+    }
+
+    @Override
+    public VolumeStatus umountMac() throws CommonIOException {
+        if (!isMountedMac()) return VolumeStatus.UNMOUNTED;
+
+        int status = Run.Mac.waitForStatus("diskutil unmount " + unixQuote(mountPoint));
+        return status == 0 || !isMountedMac() ? VolumeStatus.UNMOUNTED : VolumeStatus.MOUNTED;
+    }
+
+    @Override
+    public VolumeStatus umountLinux() throws CommonIOException {
+        if (!isMountedLinux()) return VolumeStatus.UNMOUNTED;
+
+        int status = Run.Linux.waitForStatus("umount " + unixQuote(mountPoint));
+        return status == 0 || !isMountedLinux() ? VolumeStatus.UNMOUNTED : VolumeStatus.MOUNTED;
+    }
+
+    private boolean isMountedLinux() throws CommonIOException {
+        return Run.Linux.waitForStatus("findmnt --mountpoint " + unixQuote(mountPoint) + " --noheadings --raw") == 0;
+    }
+
+    private boolean isMountedMac() throws CommonIOException {
+        return Run.Mac.waitForStatus("diskutil info " + unixQuote(mountPoint)) == 0;
+    }
+
+    private boolean isMountedWindows() throws CommonIOException {
+        return Run.Windows.waitForStatus("mountvol " + windowsQuote(mountPoint)) == 0;
+    }
+
+    private boolean exists(String path) {
+        return Files.exists(Paths.get(path));
+    }
+
+    private void ensureMountPoint() throws CommonIOException {
+        Path path = Paths.get(mountPoint);
+        try {
+            if (!Files.exists(path)) Files.createDirectories(path);
+        } catch (IOException e) {
+            throw new CommonIOException("Unable to create mount point '" + mountPoint + "': " + e.getMessage());
+        }
+    }
+
+    private String unixQuote(String value) {
+        return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    private String windowsQuote(String value) {
+        return "\"" + value.replace("\"", "\\\"") + "\"";
+    }
+
+}
