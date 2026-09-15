@@ -25,4 +25,7 @@ public interface SecretStore extends ReadOnlySecretStore {
     @Override
     String read();
     void write(String value);
+
+    /** Clears the stored secret when the associated server-side material is reset. */
+    default void clear() { }
 }

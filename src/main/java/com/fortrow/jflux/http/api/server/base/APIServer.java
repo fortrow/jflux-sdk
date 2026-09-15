@@ -35,6 +35,10 @@ import com.fortrow.jflux.http.api.server.impl.APIEvents;
 import com.fortrow.jflux.http.api.server.impl.ClientFilter;
 import com.fortrow.jflux.http.api.server.resources.APIResource;
 import com.fortrow.jflux.http.api.server.resources.APIResources;
+import com.fortrow.jflux.http.api.server.session.SessionAllocationAssertion;
+import com.fortrow.jflux.http.api.server.session.SessionAllocationManager;
+import com.fortrow.jflux.http.api.server.session.SessionCapacity;
+import com.fortrow.jflux.http.api.server.session.SessionResumeTokenStore;
 import com.fortrow.jflux.http.api.server.types.APIServerType;
 import com.fortrow.jflux.http.api.server.types.ContentType;
 import com.fortrow.jflux.http.api.types.EncryptedRequestType;
@@ -79,6 +83,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     private final ArrayList<RemoteClient> clients = new ArrayList<RemoteClient>();
     private final ArrayList<ClientSession> clientSessions = new ArrayList<ClientSession>();
     private final ArrayList<APISession> pastSessions = new ArrayList<APISession>();
+    private final SessionCapacity sessionCapacity;
+    private final SessionAllocationManager sessionAllocationManager = new SessionAllocationManager();
+    private final SessionResumeTokenStore resumeTokenStore;
     private final boolean isPublicApi;
     private LogFile log;
     private HttpServer httpServer;
@@ -96,6 +103,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         this.asyncExecutor = new ThreadExecutor(config.getAsyncThreads());
         this.isPublicApi = this.config.isPublicApi();
         this.log = this.config.getLog();
+        this.resumeTokenStore = new SessionResumeTokenStore(config.getSessionResumeStorePath());
+        this.sessionCapacity = new SessionCapacity(config.getSessionResumeStorePath());
 
         if(config.getApiPath().isEmpty()) {
             throw new APIException("Server could not be started successfully. " +
@@ -214,6 +223,44 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         );
     }
 
+    /** Returns the current per-API-key session capacity. */
+    public int getSessionLimit(String apiKey) {
+        return sessionCapacity.limitFor(apiKey);
+    }
+
+    /**
+     * Invalidates every live session and outstanding token for one root API
+     * key, then restores that key's capacity to one session.
+     */
+    public synchronized void resetSessionsForApiKey(String apiKey) throws APIException {
+        if (apiKey == null || apiKey.isBlank()) return;
+        invalidateSessionsByApiKey(apiKey);
+        clients.removeIf(client -> SecureCompare.equals(client.getApiKey(), apiKey));
+        resumeTokenStore.invalidateForApiKey(apiKey);
+        sessionAllocationManager.invalidateApiKey(apiKey);
+        sessionCapacity.reset(apiKey);
+    }
+
+    private int activeSessionsForApiKey(String apiKey) {
+        int count = 0;
+        for (ClientSession session : clientSessions) {
+            if (sessionMatchesApiKey(session, apiKey)) count++;
+        }
+        return count;
+    }
+
+    /** Returns unique live-session IPs for an already authenticated limit response. */
+    private List<String> sessionIpAddressesForApiKey(String apiKey) {
+        LinkedHashSet<String> addresses = new LinkedHashSet<>();
+        for (ClientSession session : clientSessions) {
+            if (!sessionMatchesApiKey(session, apiKey) || session.getClient() == null
+                    || session.getClient().getClientInfo() == null) continue;
+            String address = session.getClient().getClientInfo().getRemoteIp();
+            if (address != null && !address.isBlank()) addresses.add(address);
+        }
+        return new ArrayList<>(addresses);
+    }
+
     public void invalidateSession(ClientSession clientSession) {
 
         for(int i=clientSessions.size() - 1; i>=0; i--) {
@@ -229,15 +276,19 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
     private void lockSessionApiKey(ClientSession clientSession, String reason) {
         if(clientSession == null) return;
-        lockApiKey(clientSession, reason);
-        String apiKey = sessionApiKey(clientSession);
-        if(apiKey != null && !apiKey.isBlank()) invalidateSessionsByApiKey(apiKey);
+        // A stale ratchet, key-set id, or lost response belongs to one
+        // encrypted session. Revoking the root API key here lets a transient
+        // reconnect failure permanently destroy every session for that user.
+        invalidateSession(clientSession);
+        if(log != null) log.write("Invalidated the affected encrypted API session: "
+                + (reason == null || reason.isBlank() ? "authentication failure" : reason));
     }
 
     private void lockApiKeyMaterial(APIKeys apiKeys, String reason) {
         if(apiKeys == null) return;
-        lockApiKey(apiKeys, reason);
-        if(apiKeys.getKey() != null && !apiKeys.getKey().isBlank()) invalidateSessionsByApiKey(apiKeys.getKey());
+        // There is no verified session to revoke. Do not delete persistent
+        // API-key material based only on an untrusted/stale session id.
+        if(log != null) log.write("Rejected a request with an invalid encrypted session identifier.");
     }
 
     private void invalidateSessionsByApiKey(String apiKey) {
@@ -705,7 +756,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 APIKeys apiKeys = null;
 
-                if (!isPublicApi && !headers.contains("X-Api-Key") && !resource.equals(config.getEncryptedSessionPaths()[0])) {
+                if (!isPublicApi && !headers.contains("X-Api-Key") && !isSessionBootstrapResource(resource)) {
                     log.write("Missing 'X-Api-Key' header.");
                     unauthorized(r);
                     return;
@@ -736,16 +787,68 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     return;
                 }
 
-                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
-
                 invalidateOldSessions();
+
+                if (isSessionResetResource(resource) || isSessionAllocateResource(resource)) {
+                    APIResponse controlResponse;
+                    try {
+                        controlResponse = isSessionResetResource(resource)
+                                ? handleSessionReset(apiKeys, headers)
+                                : handleSessionAllocate(apiKeys, headers, reqBody);
+                    } catch (APIException ex) {
+                        ExceptionHandling.report(ex);
+                        serverError(r);
+                        return;
+                    }
+                    sendControlResponse(r, controlResponse);
+                    return;
+                }
+
+                boolean earlyResumeAuthorized = false;
+                if (isSessionResumeResource(resource)) {
+                    JSONObject resumeRequest = parseControlObject(reqBody);
+                    String resumeToken = controlString(resumeRequest, "resume_token");
+                    String resumedSessionId = resumeTokenStore.sessionForToken(apiKeys.getKey(), apiKeys.getSecret(), resumeToken);
+                    earlyResumeAuthorized = resumedSessionId != null
+                            && resumeTokenStore.isEarlyToken(apiKeys.getKey(), apiKeys.getSecret(), resumedSessionId, resumeToken);
+                    if (!earlyResumeAuthorized && !rootSessionAuthorizationValid(headers, apiKeys)) {
+                        unauthorized(r);
+                        return;
+                    }
+                    SessionResumeTokenStore.ConsumeResult resumeResult;
+                    try {
+                        resumeResult = resumeTokenStore.consume(apiKeys.getKey(), apiKeys.getSecret(), controlString(resumeRequest, "resume_token"));
+                    } catch (APIException ex) {
+                        ExceptionHandling.report(ex);
+                        serverError(r);
+                        return;
+                    }
+                    if (resumeResult != SessionResumeTokenStore.ConsumeResult.VALID) {
+                        JSONObject resumeFailure = new JSONObject();
+                        resumeFailure.put("request_status", "unauthorized");
+                        resumeFailure.put("message", "The session resume token is invalid, expired, or has already been used.");
+                        sendResponse(r, 401, JSON.getString(resumeFailure), ContentType.JSON);
+                        return;
+                    }
+                    if (resumedSessionId != null) {
+                        for (ClientSession existing : new ArrayList<>(clientSessions)) {
+                            if (sessionMatchesApiKey(existing, apiKeys.getKey())
+                                    && resumedSessionId.equals(existing.getSession().getSessionId())) {
+                                invalidateSession(existing);
+                            }
+                        }
+                        invalidateResumeTokens(apiKeys.getKey(), resumedSessionId);
+                    }
+                }
+
+                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
 
                 ClientSession clientSession = null;
                 RemoteClient client = null;
 
                 if (clientIndex < 0 && !isPublicApi) {
 
-                    if(isEncrypted() && headers.contains("X-Api-Session-Id") && !config.getEncryptedSessionPaths()[0].equals(resource)) {
+                    if(isEncrypted() && headers.contains("X-Api-Session-Id") && !isSessionInitOrResumeResource(resource)) {
                         log.write("Session not found for API key; client must reinitialize the encrypted session.");
                         unauthorized(r);
                         return;
@@ -765,7 +868,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
 
                         if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            lockSessionApiKey(clientSession, "Initial API authorization failed to validate.");
+                            // Reject only this newly-created session. A bad or
+                            // stale reconnect root must not destroy the API
+                            // credential needed for a recovery attempt.
+                            invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
                             unauthorized(r);
                             return;
@@ -774,7 +880,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            unauthorized(r);
+                            sendControlResponse(r, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
+                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
                         }
 
@@ -794,7 +902,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                     client = clients.get(clientIndex);
 
-                    if(isEncrypted() && config.getEncryptedSessionPaths()[0].equals(resource)) {
+                    if(isEncrypted() && isSessionInitOrResumeResource(resource)) {
 
                         try {
                             clientSession = appendNewSession(client, apiKeys, new ClientInfo(
@@ -811,7 +919,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         apiKeys = clientSession.getSession().getApiKeys();
 
                         if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            lockSessionApiKey(clientSession, "Initial API authorization failed to validate.");
+                            // Reject only this newly-created session. A bad or
+                            // stale reconnect root must not destroy the API
+                            // credential needed for a recovery attempt.
+                            invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
                             unauthorized(r);
                             return;
@@ -820,7 +931,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            unauthorized(r);
+                            sendControlResponse(r, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
+                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
                         }
 
@@ -877,7 +990,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 BodyParameters parameters = null;
                 boolean requestIsEncrypted = isEncryptedTransfer(headers);
                 byte[] requestAad = null;
-                boolean isSessionInitResource = isEncrypted() && config.getEncryptedSessionPaths()[0].equals(resource);
+                boolean isSessionInitResource = isSessionBootstrapResource(resource);
 
                 if (isEncrypted() && !isJsonContentType(headers)) {
                     log.write("Encrypted requests require JSON Content-Type.");
@@ -963,7 +1076,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         : null;
 
                 try {
-                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.path());
+                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.path(), earlyResumeAuthorized);
                 } catch (Exception e) {
                 ExceptionHandling.report(e);
                     log.write("Server Error: " + e.getMessage());
@@ -988,6 +1101,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         case TOO_MANY_REQUESTS:
                             if(!sendResponse(r, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
+                        case SESSION_LIMIT_REACHED:
+                            if(!sendResponse(r, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            break;
                         case REQUEST_TIMEOUT:
                             if(!sendResponse(r, 408, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
@@ -1005,6 +1121,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             if(!sendResponse(r, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
 
+                    }
+
+                    if (responseCode == ResponseCode.SUCCESSFUL && isSessionCloseResource(resource)) {
+                        invalidateSession(clientSession);
                     }
 
                 } catch (Exception ex) {
@@ -1093,7 +1213,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 APIKeys apiKeys = null;
 
-                if ((!isPublicApi && !headers.contains("X-Api-Key")) && !resource.equals(config.getEncryptedSessionPaths()[0])) {
+                if ((!isPublicApi && !headers.contains("X-Api-Key")) && !isSessionBootstrapResource(resource)) {
                     log.write("Missing 'X-Api-Key' header.");
                     unauthorized(t);
                     return;
@@ -1124,16 +1244,68 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     return;
                 }
 
-                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
-
                 invalidateOldSessions();
+
+                if (isSessionResetResource(resource) || isSessionAllocateResource(resource)) {
+                    APIResponse controlResponse;
+                    try {
+                        controlResponse = isSessionResetResource(resource)
+                                ? handleSessionReset(apiKeys, headers)
+                                : handleSessionAllocate(apiKeys, headers, reqBody);
+                    } catch (APIException ex) {
+                        ExceptionHandling.report(ex);
+                        serverError(t);
+                        return;
+                    }
+                    sendControlResponse(t, controlResponse);
+                    return;
+                }
+
+                boolean earlyResumeAuthorized = false;
+                if (isSessionResumeResource(resource)) {
+                    JSONObject resumeRequest = parseControlObject(reqBody);
+                    String resumeToken = controlString(resumeRequest, "resume_token");
+                    String resumedSessionId = resumeTokenStore.sessionForToken(apiKeys.getKey(), apiKeys.getSecret(), resumeToken);
+                    earlyResumeAuthorized = resumedSessionId != null
+                            && resumeTokenStore.isEarlyToken(apiKeys.getKey(), apiKeys.getSecret(), resumedSessionId, resumeToken);
+                    if (!earlyResumeAuthorized && !rootSessionAuthorizationValid(headers, apiKeys)) {
+                        unauthorized(t);
+                        return;
+                    }
+                    SessionResumeTokenStore.ConsumeResult resumeResult;
+                    try {
+                        resumeResult = resumeTokenStore.consume(apiKeys.getKey(), apiKeys.getSecret(), controlString(resumeRequest, "resume_token"));
+                    } catch (APIException ex) {
+                        ExceptionHandling.report(ex);
+                        serverError(t);
+                        return;
+                    }
+                    if (resumeResult != SessionResumeTokenStore.ConsumeResult.VALID) {
+                        JSONObject resumeFailure = new JSONObject();
+                        resumeFailure.put("request_status", "unauthorized");
+                        resumeFailure.put("message", "The session resume token is invalid, expired, or has already been used.");
+                        sendResponse(t, 401, JSON.getString(resumeFailure), ContentType.JSON);
+                        return;
+                    }
+                    if (resumedSessionId != null) {
+                        for (ClientSession existing : new ArrayList<>(clientSessions)) {
+                            if (sessionMatchesApiKey(existing, apiKeys.getKey())
+                                    && resumedSessionId.equals(existing.getSession().getSessionId())) {
+                                invalidateSession(existing);
+                            }
+                        }
+                        invalidateResumeTokens(apiKeys.getKey(), resumedSessionId);
+                    }
+                }
+
+                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
 
                 ClientSession clientSession = null;
                 RemoteClient client = null;
 
                 if (clientIndex < 0 && !isPublicApi) {
 
-                    if(isEncrypted() && headers.contains("X-Api-Session-Id") && !config.getEncryptedSessionPaths()[0].equals(resource)) {
+                    if(isEncrypted() && headers.contains("X-Api-Session-Id") && !isSessionInitOrResumeResource(resource)) {
                         log.write("Session not found for API key; client must reinitialize the encrypted session.");
                         unauthorized(t);
                         return;
@@ -1153,7 +1325,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
 
                         if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            lockSessionApiKey(clientSession, "Initial API authorization failed to validate.");
+                            // Reject only this newly-created session. A bad or
+                            // stale reconnect root must not destroy the API
+                            // credential needed for a recovery attempt.
+                            invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
                             unauthorized(t);
                             return;
@@ -1162,7 +1337,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            unauthorized(t);
+                            sendControlResponse(t, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
+                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
                         }
 
@@ -1182,7 +1359,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                     client = clients.get(clientIndex);
 
-                    if(isEncrypted() && config.getEncryptedSessionPaths()[0].equals(resource)) {
+                    if(isEncrypted() && isSessionInitOrResumeResource(resource)) {
 
                         try {
                             clientSession = appendNewSession(client, apiKeys, new ClientInfo(
@@ -1199,7 +1376,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         apiKeys = clientSession.getSession().getApiKeys();
 
                         if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            lockSessionApiKey(clientSession, "Initial API authorization failed to validate.");
+                            // Reject only this newly-created session. A bad or
+                            // stale reconnect root must not destroy the API
+                            // credential needed for a recovery attempt.
+                            invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
                             unauthorized(t);
                             return;
@@ -1208,7 +1388,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            unauthorized(t);
+                            sendControlResponse(t, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
+                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
                         }
 
@@ -1265,7 +1447,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 BodyParameters parameters = null;
                 boolean requestIsEncrypted = isEncryptedTransfer(headers);
                 byte[] requestAad = null;
-                boolean isSessionInitResource = isEncrypted() && config.getEncryptedSessionPaths()[0].equals(resource);
+                boolean isSessionInitResource = isSessionBootstrapResource(resource);
 
                 if (isEncrypted() && !isJsonContentType(headers)) {
                     log.write("Encrypted requests require JSON Content-Type.");
@@ -1351,7 +1533,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         : null;
 
                 try {
-                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.getRequestURI().getPath());
+                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.getRequestURI().getPath(), earlyResumeAuthorized);
                 } catch (Exception e) {
             ExceptionHandling.report(e);
                     log.write("Server Error: " + e.getMessage());
@@ -1376,6 +1558,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         case TOO_MANY_REQUESTS:
                             if(!sendResponse(t, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
+                        case SESSION_LIMIT_REACHED:
+                            if(!sendResponse(t, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            break;
                         case REQUEST_TIMEOUT:
                             if(!sendResponse(t, 408, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
@@ -1393,6 +1578,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             if(!sendResponse(t, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
 
+                    }
+
+                    if (responseCode == ResponseCode.SUCCESSFUL && isSessionCloseResource(resource)) {
+                        invalidateSession(clientSession);
                     }
 
                 } catch (Exception ex) {
@@ -1414,6 +1603,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         private void invalidateOldSessions() {
             for(int i=clientSessions.size() - 1; i>=0; i--) {
                 if(clientSessions.get(i).getSession().invalidateByTime()) {
+                    clientSessions.get(i).getSession().deactivate();
                     sessionInvalidated(clientSessions.get(i));
                     pastSessions.add(clientSessions.get(i).getSession());
                     clientSessions.remove(i);
@@ -1462,6 +1652,133 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return "POST";
         }
 
+        private boolean isSessionInitResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[0]);
+        }
+
+        private boolean isSessionResumeResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[2]);
+        }
+
+        private boolean isSessionResetResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[3]);
+        }
+
+        private boolean isSessionAllocateResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[4]);
+        }
+
+        private boolean isSessionHeartbeatResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[5]);
+        }
+
+        private boolean isSessionCloseResource(String resource) {
+            return isEncrypted() && __.same(resource, config.getEncryptedSessionPaths()[1]);
+        }
+
+        private boolean isSessionBootstrapResource(String resource) {
+            return isSessionInitResource(resource) || isSessionResumeResource(resource)
+                    || isSessionResetResource(resource) || isSessionAllocateResource(resource);
+        }
+
+        private boolean isSessionInitOrResumeResource(String resource) {
+            return isSessionInitResource(resource) || isSessionResumeResource(resource);
+        }
+
+        private boolean rootSessionAuthorizationValid(RequestHeaders headers, APIKeys apiKeys) {
+            if (headers == null || apiKeys == null) return false;
+            return SecureCompare.equals(apiKeys.getSessionSecret(), headers.getString("X-Api-Session-Authorization"));
+        }
+
+        private JSONObject parseControlObject(String body) {
+            if (body == null || body.isBlank()) return new JSONObject();
+            JSONObject object = JSON.getObject(body);
+            return object == null ? new JSONObject() : object;
+        }
+
+        private String controlString(JSONObject object, String key) {
+            Object value = object == null ? null : object.get(key);
+            return value == null ? "" : value.toString().trim();
+        }
+
+        private APIResponse handleSessionReset(APIKeys apiKeys, RequestHeaders headers) throws APIException {
+            if (!rootSessionAuthorizationValid(headers, apiKeys)
+                    && !resetSessionAuthorizationValid(headers, apiKeys)) {
+                JSONObject response = new JSONObject();
+                response.put("request_status", "unauthorized");
+                response.put("error_code", "JFLUX_SESSION_RESET_UNAUTHORIZED");
+                response.put("message", "The session reset authorization was invalid or expired.");
+                return new APIResponse(null, response, ResponseCode.UNAUTHORIZED, false);
+            }
+            resetSessionsForApiKey(apiKeys.getKey());
+            JSONObject response = new JSONObject();
+            response.put("request_status", "success");
+            response.put("message", "All sessions and outstanding resume tokens were invalidated.");
+            response.put("session_limit", 1);
+            return new APIResponse(null, response, ResponseCode.SUCCESSFUL, false);
+        }
+
+        private boolean resetSessionAuthorizationValid(RequestHeaders headers, APIKeys apiKeys) {
+            if (headers == null || apiKeys == null) return false;
+            String timestamp = headers.getString("X-Request-Timestamp");
+            String randomBytes = headers.getString("X-Api-Random-Bytes");
+            String authorization = headers.getString("X-Api-Reset-Authorization");
+            if (timestamp == null || !timestamp.matches("[0-9]{1,20}")
+                    || randomBytes == null || !randomBytes.matches("(?i)[0-9a-f]{88}")) {
+                return false;
+            }
+            return APIKeys.verifySessionResetAuthorization(
+                    authorization, apiKeys.getSecret(), apiKeys.getKey(), timestamp, randomBytes);
+        }
+
+        private APIResponse handleSessionAllocate(APIKeys apiKeys, RequestHeaders headers, String body) throws APIException {
+            if (!rootSessionAuthorizationValid(headers, apiKeys)) {
+                return new APIResponse(null, ResponseCode.UNAUTHORIZED);
+            }
+            if (apiKeys.getRawSessionAllocationSecret() == null || apiKeys.getRawSessionAllocationSecret().isBlank()) {
+                JSONObject response = new JSONObject();
+                response.put("request_status", "allocation_not_configured");
+                response.put("message", "A private session allocation signing secret is not configured for this API key.");
+                return new APIResponse(null, response, ResponseCode.FORBIDDEN, false);
+            }
+
+            JSONObject request = parseControlObject(body);
+            if (!controlString(request, "oauth_token").isBlank()
+                    || request.containsKey("additional_sessions") || request.containsKey("sessions")) {
+                return new APIResponse(null, ResponseCode.REQUEST_FAILED,
+                        "OAuth-style allocation tokens and configurable allocation amounts are not supported. Submit one signed allocation assertion.");
+            }
+            String challengeId = controlString(request, "challenge_id");
+            String signature = controlString(request, "signature");
+            if (!challengeId.isBlank() || !signature.isBlank()) {
+                SessionAllocationAssertion assertion = SessionAllocationAssertion.fromJson(request);
+                if (!sessionAllocationManager.verifyAndConsume(
+                        apiKeys.getKey(), apiKeys.getRawSessionAllocationSecret(), assertion)) {
+                    JSONObject response = new JSONObject();
+                    response.put("request_status", "unauthorized");
+                    response.put("message", "The session allocation assertion is invalid, expired, or has already been used.");
+                    return new APIResponse(null, response, ResponseCode.UNAUTHORIZED, false);
+                }
+                int limit = sessionCapacity.allocate(apiKeys.getKey());
+                JSONObject response = new JSONObject();
+                response.put("request_status", "success");
+                response.put("allocated_sessions", 1);
+                response.put("session_limit", limit);
+                return new APIResponse(null, response, ResponseCode.SUCCESSFUL, false);
+            }
+
+            SessionAllocationManager.Challenge challenge = sessionAllocationManager.issueChallenge(
+                    apiKeys.getKey(), config.getAllocationChallengeLifetime()
+            );
+            JSONObject response = new JSONObject();
+            response.put("request_status", "authentication_challenge");
+            response.put("challenge_id", challenge.id());
+            response.put("challenge", challenge.value());
+            response.put("expires_at_ms", challenge.expiresAt().toEpochMilli());
+            response.put("signature_algorithm", "HMAC-SHA384");
+            return new APIResponse(null, response, ResponseCode.SUCCESSFUL, false);
+        }
+
         private ClientSession appendNewClient(APIKeys keys, ClientInfo info) throws APIException {
 
             return ClientSession.createClient(info, keys, APIServer.this, isEncrypted());
@@ -1470,8 +1787,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
         private ClientSession appendNewSession(RemoteClient client, APIKeys keys, ClientInfo info) throws APIException {
 
-            APISession session = new APISession(keys, info.getRemoteIp(), config.getServerType(),
-                    config.getMinutesTillInvalid(), isEncrypted());
+            APISession session = new APISession(keys.copyForSession(), info.getRemoteIp(), config.getServerType(),
+                    config.getMinutesTillInvalid(), config.isSessionExpirationEnabled(), isEncrypted());
             return new ClientSession(info, client, session);
 
         }
@@ -1481,7 +1798,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             for(int i=clientSessions.size() - 1; i>=0; i--) {
                 if(__.same(client.getClientInfo().getRemoteIp(), clientSessions.get(i).getClient().getClientInfo().getRemoteIp())) {
                     count++;
-                    if(count > config.getMaxSessions()) {
+                    if(count > sessionCapacity.limitFor(client.getApiKey())) {
                         sessionInvalidated(clientSessions.get(i));
                         pastSessions.add(clientSessions.get(i).getSession());
                         clientSessions.remove(i);
@@ -1616,30 +1933,13 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
         private boolean sessionAllowed(ClientSession client, String apiKey) {
-
             if (apiKey == null || apiKey.isBlank()) return false;
-
-            int numSessions = 0;
-
-            for(int i=0; i<clientSessions.size(); i++) {
-
-                RemoteClient currentClient = clientSessions.get(i).getClient();
-                String clientApiKey = currentClient.getApiKey();
-
-                if(SecureCompare.equals(apiKey, clientApiKey)) {
-                    numSessions++;
-                    continue;
-                }
-
-                APISession currentSession = clientSessions.get(i).getSession();
-                String sessionApiKey = currentSession.getApiKeys().getKey();
-
-                if(SecureCompare.equals(apiKey, sessionApiKey))
-                    numSessions++;
-
+            java.util.Set<String> live = new java.util.HashSet<>();
+            for (ClientSession current : clientSessions) {
+                if (sessionMatchesApiKey(current, apiKey)) live.add(current.getSession().getSessionId());
             }
-
-            return (numSessions <= config.getMaxSessions());
+            return activeSessionsForApiKey(apiKey) + resumeTokenStore.outstandingForApiKey(apiKey, live)
+                    <= sessionCapacity.limitFor(apiKey);
 
         }
 
@@ -1715,7 +2015,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     "X-Api-Key", "X-Request-Timestamp", "X-Request-Signature",
                     "X-Request-Sequence", "X-Api-Session-Id", "X-Api-Key-Set-Id",
                     "X-Api-Session-Authorization", "X-Api-Authorization", "X-Api-Random-Bytes",
-                    "X-Api-Resource-Method", "Content-Transfer-Encoding", "Content-Type"
+                    "X-Api-Reset-Authorization", "X-Api-Resource-Method",
+                    "Content-Transfer-Encoding", "Content-Type"
             )) {
                 return false;
             }
@@ -1724,7 +2025,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     || config.getServerType() == APIServerType.ENCRYPTED_SYNC
             ) {
 
-                if(config.getEncryptedSessionPaths()[0].equals(resource)) {
+                if(isSessionBootstrapResource(resource)) {
 
                     return headers.contains("X-Request-Timestamp")
                             && headers.contains("X-Api-Key")
@@ -1791,7 +2092,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return output.toString(StandardCharsets.UTF_8);
         }
 
-        private APIResponse processRequest(RequestHeaders headers, ClientSession clientSession, String resourceName, String resourceMethod, BodyParameters params, String urlPath) throws Exception {
+        private APIResponse processRequest(RequestHeaders headers, ClientSession clientSession, String resourceName, String resourceMethod, BodyParameters params, String urlPath, boolean earlyResumeAuthorized) throws Exception {
 
             boolean isSessionResource = isEncrypted() && Arrays.asList(config.getEncryptedSessionPaths()).contains(resourceName);
             boolean isResponseResource = isAsyncResponseResource(resourceName);
@@ -1803,15 +2104,22 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             if(isEncrypted()) {
 
                 if(isSessionResource) {
-                    EncryptedRequestType requestType = config.getEncryptedSessionPaths()[0].equals(resourceName)
+                    String[] sessionPaths = config.getEncryptedSessionPaths();
+                    EncryptedRequestType requestType = sessionPaths[0].equals(resourceName)
                             ? EncryptedRequestType.SESSION_INIT
+                            : sessionPaths[2].equals(resourceName)
+                            ? EncryptedRequestType.SESSION_RESUME
+                            : isSessionHeartbeatResource(resourceName)
+                            ? EncryptedRequestType.SESSION_HEARTBEAT
                             : EncryptedRequestType.SESSION_CLOSE;
 
-                    if(requestType == EncryptedRequestType.SESSION_INIT) {
+                    if(requestType == EncryptedRequestType.SESSION_INIT || requestType == EncryptedRequestType.SESSION_RESUME) {
                         String sessionSecret = clientSession.getSession().getApiKeys().getSessionSecret();
                         String headerAuth = headers.getString("X-Api-Session-Authorization");
-                        if (!__.same(sessionSecret, headerAuth)) {
-                            lockSessionApiKey(clientSession, "Invalid session initialization secret.");
+                        if (!earlyResumeAuthorized && !__.same(sessionSecret, headerAuth)) {
+                            // The session root is invalid, but the API key may
+                            // still be recoverable with its other root secret.
+                            invalidateSession(clientSession);
                             return new APIResponse(clientSession, ResponseCode.UNAUTHORIZED);
                         }
                     } else if(!isAuthenticated(headers, resource, params, clientSession)) {
@@ -1921,12 +2229,14 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
         private APIResponse processRequestEncryptedSync(ClientSession clientSession, APIResource resource, BodyParameters params, RequestHeaders headers, EncryptedRequestType type, String resourceMethod) throws Exception {
-            if(type == EncryptedRequestType.SESSION_INIT) {
+            if(type == EncryptedRequestType.SESSION_INIT || type == EncryptedRequestType.SESSION_RESUME) {
                 APIResponse resp = initializeSession(clientSession);
                 resp.encryptWithPsk();
                 return resp;
             } else if(type == EncryptedRequestType.SESSION_CLOSE) {
                 return sessionClose(params, headers, clientSession);
+            } else if(type == EncryptedRequestType.SESSION_HEARTBEAT) {
+                return sessionHeartbeat(clientSession, params);
             } else if(type == EncryptedRequestType.EXECUTE_RESOURCE) {
 
                 InboundRequest inboundRequest = new InboundRequest(clientSession, params, headers);
@@ -1956,6 +2266,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             String sessionId = clientSession.getSession().getSessionId();
 
             obj.put("session_id", sessionId);
+            obj.put("early_resume_supported", config.isActiveSessionRecoveryEnabled());
             obj.put("request_status", "success");
 
             String randomBytes = clientSession.getSession().getRandomBytes();
@@ -2014,11 +2325,29 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     );
 
             if(closeAuthorized) {
+                invalidateResumeTokens(apiKeys.getKey(), expectedSessionId);
                 JSONObject obj = new JSONObject();
                 obj.put("request_status", "success");
                 obj.put("session_id", expectedSessionId);
+                if (paramBoolean(params, "create_resume_token") || paramBoolean(params, "resume")) {
+                    String resumeToken;
+                    try {
+                        resumeToken = resumeTokenStore.issue(
+                                apiKeys.getKey(), apiKeys.getSecret(), expectedSessionId,
+                                java.time.Duration.ofMinutes(config.getResumeTokenMinutes())
+                        );
+                    } catch (APIException ex) {
+                        ex.tryReport();
+                        return new APIResponse(clientSession, ResponseCode.SERVER_ERROR);
+                    }
+                    obj.put("resume_token", resumeToken);
+                    obj.put("resume_expires_at_ms", System.currentTimeMillis() + config.getResumeTokenMinutes() * 60_000L);
+                }
                 APIResponse response = new APIResponse(clientSession, obj, ResponseCode.SUCCESSFUL);
                 response.encrypt();
+                // The encrypted response must be prepared while the session
+                // keys are still available, but an authorized close must no
+                // longer count against the API key's active-session limit.
                 invalidateSession(clientSession);
                 return response;
             }
@@ -2028,8 +2357,42 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
         }
 
+        private APIResponse sessionHeartbeat(ClientSession clientSession, BodyParameters params) throws Exception {
+            JSONObject obj = new JSONObject();
+            obj.put("request_status", "success");
+            obj.put("session_id", clientSession.getSession().getSessionId());
+            obj.put("heartbeat", true);
+            if (config.isActiveSessionRecoveryEnabled() && paramBoolean(params, "create_resume_token")) {
+                APIKeys keys = clientSession.getSession().getApiKeys();
+                try {
+                    obj.put("resume_token", resumeTokenStore.issueWhileActive(keys.getKey(), keys.getSecret(),
+                            clientSession.getSession().getSessionId(), java.time.Duration.ofMinutes(config.getResumeTokenMinutes())));
+                } catch (APIException error) {
+                    throw new IOException("Could not issue early resume token.", error);
+                }
+                obj.put("resume_expires_at_ms", System.currentTimeMillis() + config.getResumeTokenMinutes() * 60_000L);
+            }
+            APIResponse response = new APIResponse(clientSession, obj, ResponseCode.SUCCESSFUL);
+            response.encrypt();
+            return response;
+        }
+
+        private void invalidateResumeTokens(String apiKey, String sessionId) throws IOException {
+            try {
+                resumeTokenStore.invalidateForSession(apiKey, sessionId);
+            } catch (APIException error) {
+                throw new IOException("Could not invalidate resume tokens.", error);
+            }
+        }
+
         private String paramString(BodyParameters params, String key) {
             return params != null && params.present(key) ? params.getString(key) : "";
+        }
+
+        private boolean paramBoolean(BodyParameters params, String key) {
+            if (params == null || !params.present(key)) return false;
+            Object value = params.get(key);
+            return value instanceof Boolean ? (Boolean) value : "true".equalsIgnoreCase(String.valueOf(value)) || "1".equals(value);
         }
 
         private void authFailure(HttpExchange t) {
@@ -2083,6 +2446,23 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             String retVal = "{\"request_status\":\"unauthorized\"}";
             sendResponse(t, 401, retVal, ContentType.JSON);
 
+        }
+
+        private void sendControlResponse(HttpExchange t, APIResponse response) {
+            if (response == null) {
+                serverError(t);
+                return;
+            }
+            ResponseCode code = response.getResponseCode();
+            int status = switch (code) {
+                case SESSION_LIMIT_REACHED, TOO_MANY_REQUESTS -> 429;
+                case UNAUTHORIZED -> 401;
+                case FORBIDDEN -> 403;
+                case REQUEST_FAILED -> 400;
+                case SERVER_ERROR -> 500;
+                default -> 200;
+            };
+            sendResponse(t, status, response.getResponse(), ContentType.JSON);
         }
 
         private void tooLarge(HttpExchange t) {
@@ -2291,6 +2671,23 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             String retVal = "{\"request_status\":\"unauthorized\"}";
             sendResponse(t, 401, retVal, ContentType.JSON);
 
+        }
+
+        private void sendControlResponse(HttpServerResponse t, APIResponse response) {
+            if (response == null) {
+                serverError(t);
+                return;
+            }
+            ResponseCode code = response.getResponseCode();
+            int status = switch (code) {
+                case SESSION_LIMIT_REACHED, TOO_MANY_REQUESTS -> 429;
+                case UNAUTHORIZED -> 401;
+                case FORBIDDEN -> 403;
+                case REQUEST_FAILED -> 400;
+                case SERVER_ERROR -> 500;
+                default -> 200;
+            };
+            sendResponse(t, status, response.getResponse(), ContentType.JSON);
         }
 
         private void tooLarge(HttpServerResponse t) {

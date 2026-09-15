@@ -74,6 +74,19 @@ byte[] sharedSecret = crypto.decapsulate(
         "ml-kem-768", encapsulated.encapsulation(), kemKeys[1]);
 ```
 
+`Cryptography.defaults()` provides the process-wide standard register for small
+applications. It also exposes the application-facing helpers used by MeridianDB:
+`hashHex`, `hmacHex`, `deriveKey`, `pbkdf2`, `randomBytes`, `randomString`, `id`,
+`shortId`, and `secureEquals`. The default register includes `hmac-sha1` for
+legacy TOTP interoperability. Ed25519
+signatures and RSA-2048/RSA-4096 key pairs are registered by name. X25519 key
+generation and key agreement are available through `generateKeyPair("x25519")`
+and `keyAgreement("x25519", privateKey, publicKey)`.
+
+Applications should use these facade methods instead of importing classes from
+`com.fortrow.jflux.crypto.builtin`; the builtin implementations remain an internal
+implementation detail of the default registry.
+
 To switch an implementation without changing callers, register a replacement under
 the same normalized name. The register uses direct map lookup and case-insensitive
 algorithm names; unknown names fail with `IllegalArgumentException` instead of

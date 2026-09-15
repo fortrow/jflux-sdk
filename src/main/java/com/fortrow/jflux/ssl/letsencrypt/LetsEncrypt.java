@@ -29,8 +29,6 @@ import com.fortrow.jflux.sys.installers.LetsEncryptInstaller;
 import com.fortrow.jflux.sys.PlatformUtils;
 
 import java.io.File;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -150,21 +148,8 @@ public class LetsEncrypt {
     }
 
     private CommandResult run(String command) {
-        try {
-            ProcessBuilder builder;
-            if(PlatformUtils.isWindows()) builder = new ProcessBuilder("cmd.exe", "/C", command);
-            else if(PlatformUtils.isMac()) builder = new ProcessBuilder("/bin/zsh", "-c", command);
-            else builder = new ProcessBuilder("/bin/bash", "-c", command);
-
-            Process process = builder.start();
-            int status = process.waitFor();
-            String stdout = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String stderr = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-            return new CommandResult(command, status, stdout, stderr);
-        } catch (IOException | InterruptedException e) {
-            if(e instanceof InterruptedException) Thread.currentThread().interrupt();
-            return new CommandResult(command, 256, "", e.getMessage());
-        }
+        com.fortrow.jflux.shell.CommandResult result = com.fortrow.jflux.shell.Shell.execute(command);
+        return new CommandResult(command, result.exitCode(), result.stdout(), result.stderr());
     }
 
     private static File fileFromOutput(String prefix, String output) {
@@ -209,7 +194,7 @@ public class LetsEncrypt {
             this.email = email;
             this.domains = new ArrayList<>();
             this.domains.add(domain);
-            this.domains.addAll(Arrays.asList(subjectAltNames));
+            if (subjectAltNames != null) this.domains.addAll(Arrays.asList(subjectAltNames));
             this.certificateName = safeName(domain);
         }
 
@@ -239,7 +224,7 @@ public class LetsEncrypt {
         }
 
         public Request pfxPassword(String pfxPassword) {
-            this.pfxPassword = pfxPassword;
+            this.pfxPassword = pfxPassword == null ? "" : pfxPassword;
             return this;
         }
 
@@ -249,6 +234,7 @@ public class LetsEncrypt {
             if(domains.isEmpty() || domains.get(0) == null || domains.get(0).isBlank()) throw new CommonIOException("At least one domain is required.");
             if(challengePort < 1 || challengePort > 65535) throw new CommonIOException("Challenge port must be between 1 and 65535.");
             if(listenerTimeoutSeconds < 1) throw new CommonIOException("Listener timeout must be greater than zero.");
+            if(pfxPassword == null || pfxPassword.isBlank()) throw new CommonIOException("PFX password cannot be blank.");
             for(String domain : domains) {
                 if(domain == null || domain.isBlank()) throw new CommonIOException("Domain names cannot be blank.");
                 if(domain.startsWith("*.")) throw new CommonIOException("Standalone HTTP challenges cannot request wildcard certificates. Use a DNS challenge for " + domain + ".");
@@ -264,7 +250,7 @@ public class LetsEncrypt {
         }
 
         public List<String> domains() {
-            return domains;
+            return List.copyOf(domains);
         }
 
         public String certificateName() {
@@ -293,7 +279,7 @@ public class LetsEncrypt {
 
         private static String safeName(String value) {
             if(value == null || value.isBlank()) return "letsencrypt";
-            return value.toLowerCase().replaceAll("[^a-z0-9.-]", "-").replaceAll("-+", "-").replaceAll("^-|-$", "");
+            return value.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9.-]", "-").replaceAll("-+", "-").replaceAll("^-|-$", "");
         }
     }
 
@@ -307,7 +293,7 @@ public class LetsEncrypt {
             this.success = success;
             this.message = message;
             this.certKeyPair = certKeyPair;
-            this.commands = commands;
+            this.commands = List.copyOf(commands == null ? List.of() : commands);
         }
 
         public static RequestResult success(String message, SslCertKeyPair certKeyPair, List<CommandResult> commands) {

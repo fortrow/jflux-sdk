@@ -25,6 +25,8 @@ import com.fortrow.jflux.db.supporting.sql.*;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 //QUERY PARAMS CLASS MAY BE UNNECESSARY
 //HOWEVER, FOR CLEANLINESS OF CODE AND TO SEPARATE
@@ -60,6 +62,17 @@ public class QueryParams implements QueryRequest {
 
     private HashMap<String, ArrayList<TableSchema>> createTables = new HashMap<>();
 
+    private final List<Map<String, Object>> insertRows;
+    private final String pragma;
+    private final Object pragmaValue;
+    private final boolean pragmaRead;
+    private final boolean distinct;
+    private final int limit;
+    private final int offset;
+    private final ArrayList<Condition> having;
+    private final ArrayList<Field> returning;
+    private final boolean insertIgnore;
+
     public QueryParams(
             String database,
             String table,
@@ -74,7 +87,17 @@ public class QueryParams implements QueryRequest {
             ArrayList<Condition> where,
             ArrayList<Join> join,
             HashMap<String, ArrayList<TableSchema>> createTables,
-            boolean setTimestamps
+            boolean setTimestamps,
+            List<Map<String, Object>> insertRows,
+            String pragma,
+            Object pragmaValue,
+            boolean pragmaRead,
+            boolean distinct,
+            int limit,
+            int offset,
+            ArrayList<Condition> having,
+            ArrayList<Field> returning,
+            boolean insertIgnore
     ) {
         this.database = database;
         this.table = table;
@@ -90,11 +113,21 @@ public class QueryParams implements QueryRequest {
         this.join = join;
         this.createTables = createTables;
         this.setTimestamps = setTimestamps;
+        this.insertRows = insertRows;
+        this.pragma = pragma;
+        this.pragmaValue = pragmaValue;
+        this.pragmaRead = pragmaRead;
+        this.distinct = distinct;
+        this.limit = limit;
+        this.offset = offset;
+        this.having = having;
+        this.returning = returning;
+        this.insertIgnore = insertIgnore;
     }
 
     @Override
     public boolean returns() {
-        return !select.isEmpty();
+        return !select.isEmpty() || pragmaRead || isReturning();
     }
 
     public String database() {
@@ -132,8 +165,48 @@ public class QueryParams implements QueryRequest {
     }
 
     public ArrayList<Field> selectColumns() {
-        return select;
+        return isReturning() ? returning : select;
     }
+
+    public ArrayList<Field> insert() { return insert; }
+
+    public ArrayList<Field> update() { return update; }
+
+    public ArrayList<Condition> whereConditions() { return where; }
+
+    public ArrayList<Join> joins() { return join; }
+
+    public List<Map<String, Object>> insertRows() { return insertRows; }
+
+    public boolean hasBatchInsert() { return insertRows != null && !insertRows.isEmpty(); }
+
+    public boolean isPragma() { return pragma != null; }
+
+    public String pragma() { return pragma; }
+
+    public Object pragmaValue() { return pragmaValue; }
+
+    public boolean pragmaRead() { return pragmaRead; }
+
+    public boolean distinct() { return distinct; }
+
+    public boolean hasLimit() { return limit >= 0; }
+
+    public int limit() { return limit; }
+
+    public boolean hasOffset() { return offset >= 0; }
+
+    public int offset() { return offset; }
+
+    public ArrayList<Condition> having() { return having; }
+
+    public boolean hasHaving() { return having != null && !having.isEmpty(); }
+
+    public ArrayList<Field> returning() { return returning; }
+
+    public boolean isReturning() { return returning != null && !returning.isEmpty(); }
+
+    public boolean insertIgnore() { return insertIgnore; }
 
     public void resetIndexes() {
         currSelect = -1;
@@ -229,5 +302,6 @@ public class QueryParams implements QueryRequest {
     public boolean setTimestamps() {
         return setTimestamps;
     }
+
 
 }

@@ -79,6 +79,15 @@ public class FileSecretStore implements SecretStore {
         }
     }
 
+    @Override
+    public void clear() {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to clear secret file: " + path, e);
+        }
+    }
+
     private static void secureOwnerOnly(Path path) {
         try {
             Files.setPosixFilePermissions(path, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));

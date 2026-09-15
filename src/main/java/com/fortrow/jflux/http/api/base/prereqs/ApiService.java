@@ -62,6 +62,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -80,6 +81,9 @@ public class ApiService {
     private final List<BlacklistEntry> blacklist = Collections.synchronizedList(new ArrayList<>());
     private final List<TimeoutEntry> timeouts = Collections.synchronizedList(new ArrayList<>());
     private final Map<String, ApiUserPermissions> apiUserPermissions = Collections.synchronizedMap(new HashMap<>());
+    /** API keys whose session ratchet must remain at the operator-controlled root. */
+    private final Set<String> nonPersistentSessionSecretApiKeys =
+            Collections.synchronizedSet(new HashSet<>());
     private String appName;
     private String appKey;
     private Db appDb = null;
@@ -157,6 +161,26 @@ public class ApiService {
 
     public void setSessionDb(Db sessionDb) {
         this.sessionDb = sessionDb;
+    }
+
+    /**
+     * Keeps a shared bootstrap key's root secret stable across independent
+     * clients. Session payload keys still rotate in memory, but their root is
+     * not written back to the persistent API-key record.
+     *
+     * <p>This is intended for operator-controlled bootstrap credentials that
+     * are delivered to many clients from an external control plane. Normal
+     * user API keys must retain the default durable ratchet behavior.</p>
+     */
+    public ApiService setSessionSecretPersistence(String apiKey, boolean persistent) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalArgumentException("API key is required.");
+        }
+        synchronized (nonPersistentSessionSecretApiKeys) {
+            if (persistent) nonPersistentSessionSecretApiKeys.remove(apiKey);
+            else nonPersistentSessionSecretApiKeys.add(apiKey);
+        }
+        return this;
     }
 
     public Db getApplicationDb() {
@@ -317,11 +341,24 @@ public class ApiService {
             if(payload == null || payload.isEmpty()) return null;
             String storedApiKey = stringValue(payload.get("api_key"));
             if(!SecureCompare.equals(storedApiKey, apiKey)) return null;
+            String allocationSecret = stringValue(payload.get("session_allocation_secret"));
+            if(allocationSecret.isBlank()) {
+                allocationSecret = Hex.getHex(Rand.secure(32));
+                saveApiKeyRecord(
+                        storedApiKey,
+                        stringValue(payload.get("secret")),
+                        stringValue(payload.get("session_secret")),
+                        stringValue(payload.get("psk")),
+                        allocationSecret,
+                        allowedIpsFromJson(payload.get("allowed_ips"))
+                );
+            }
             return managedApiKeys(
                     storedApiKey,
                     stringValue(payload.get("secret")),
                     stringValue(payload.get("session_secret")),
                     stringValue(payload.get("psk")),
+                    allocationSecret,
                     allowedIpsFromJson(payload.get("allowed_ips"))
             );
         } catch (APIException e) {
@@ -337,13 +374,15 @@ public class ApiService {
                 keys.getSecret(),
                 keys.getRawSessionSecret(),
                 keys.getPsk(),
+                keys.getRawSessionAllocationSecret(),
                 keys.getAllowedIps()
         );
     }
 
     public APIKeys registerApiKeys(APIKeys.Keys keys) throws APIException {
         if(keys == null) throw new APIException("API keys are required.");
-        return registerApiKeys(keys.getKey(), keys.getSecret(), keys.getSessionSecret(), keys.getPsk());
+        return registerApiKeys(keys.getKey(), keys.getSecret(), keys.getSessionSecret(), keys.getPsk(),
+                keys.getSessionAllocationSecret(), null);
     }
 
     public APIKeys registerApiKeys(String apiKey, String secret, String sessionSecret, String psk) throws APIException {
@@ -351,11 +390,41 @@ public class ApiService {
     }
 
     public APIKeys registerApiKeys(String apiKey, String secret, String sessionSecret, String psk, List<IpAddress> allowedIps) throws APIException {
-        requireApiKeyMaterial(apiKey, secret, sessionSecret, psk);
+        String allocationSecret = existingAllocationSecret(apiKey);
+        if(allocationSecret == null || allocationSecret.isBlank()) allocationSecret = Hex.getHex(Rand.secure(32));
+        return registerApiKeys(apiKey, secret, sessionSecret, psk, allocationSecret, allowedIps);
+    }
+
+    /** Registers an API key with the private secret shared by JFlux and the web-authentication backend. */
+    public APIKeys registerApiKeys(String apiKey, String secret, String sessionSecret, String psk,
+                                   String sessionAllocationSecret, List<IpAddress> allowedIps) throws APIException {
+        requireApiKeyMaterial(apiKey, secret, sessionSecret, psk, sessionAllocationSecret);
         if(apiKeyLocked(apiKey)) throw new APIException("API key is locked and cannot be reused.");
-        APIKeys managed = managedApiKeys(apiKey, secret, sessionSecret, psk, allowedIps);
-        if(usesPersistentSessions()) saveApiKeyRecord(apiKey, secret, sessionSecret, psk, allowedIps);
+        APIKeys managed = managedApiKeys(apiKey, secret, sessionSecret, psk, sessionAllocationSecret, allowedIps);
+        if(usesPersistentSessions()) saveApiKeyRecord(apiKey, secret, sessionSecret, psk, sessionAllocationSecret, allowedIps);
         return managed;
+    }
+
+    /**
+     * Replaces a trusted API key's material after an operator intentionally
+     * rotates or recovers that credential. This is separate from normal
+     * registration so a locked client key cannot be silently re-enabled.
+     */
+    public APIKeys replaceApiKeys(String apiKey, String secret, String sessionSecret, String psk,
+                                  List<IpAddress> allowedIps) throws APIException {
+        String allocationSecret = existingAllocationSecret(apiKey);
+        if(allocationSecret == null || allocationSecret.isBlank()) allocationSecret = Hex.getHex(Rand.secure(32));
+        removeApiKeyLock(apiKey);
+        return registerApiKeys(apiKey, secret, sessionSecret, psk, allocationSecret, allowedIps);
+    }
+
+    private void removeApiKeyLock(String apiKey) throws APIException {
+        if(apiKey == null || apiKey.isBlank()) return;
+        BlacklistEntry entry = new BlacklistEntry(BlacklistEntryType.API_KEY, apiKey);
+        synchronized (blacklist) {
+            blacklist.removeIf(current -> current.sameTarget(entry));
+        }
+        if(usesPersistentSessions()) deleteRecord(blacklistTable, entry.id());
     }
 
     public void lockApiKey(ClientSession clientSession, String reason) {
@@ -404,6 +473,9 @@ public class ApiService {
 
     public void updateSessionSecret(APIKeys keys, String sessionSecret) throws APIException {
         if(keys == null) return;
+        synchronized (nonPersistentSessionSecretApiKeys) {
+            if (nonPersistentSessionSecretApiKeys.contains(keys.getKey())) return;
+        }
         if(usesPersistentSessions()) {
             JSONObject obj = new JSONObject();
             obj.put("api_key", apiKeyRecordId(keys.getKey()));
@@ -411,7 +483,8 @@ public class ApiService {
             obj.put("updated_at_ms", nowMs());
             saveRecord(sessionKeysTable, apiKeyRecordId(keys.getKey()), obj);
             if(hasApiKeyMaterial(keys)) {
-                saveApiKeyRecord(keys.getKey(), keys.getSecret(), sessionSecret, keys.getPsk(), keys.getAllowedIps());
+                saveApiKeyRecord(keys.getKey(), keys.getSecret(), sessionSecret, keys.getPsk(),
+                        keys.getRawSessionAllocationSecret(), keys.getAllowedIps());
             }
         }
     }
@@ -788,7 +861,7 @@ public class ApiService {
                     new TableSchema("id", "varchar(96)", false, true, null),
                     TableSchema.col("iv", "text", false),
                     TableSchema.col("value", "text", false),
-                    TableSchema.col("updated_at_ms", "integer", false),
+                    TableSchema.col("updated_at_ms", "bigint", false),
                     TableSchema.col("payload", "text", false)
             ).run();
             sessionDb.query().createTable(
@@ -797,7 +870,7 @@ public class ApiService {
                     TableSchema.col("api_key", "text", false),
                     TableSchema.col("permissions", "text", false),
                     TableSchema.col("permitted_keys", "text", false),
-                    TableSchema.col("updated_at_ms", "integer", false),
+                    TableSchema.col("updated_at_ms", "bigint", false),
                     TableSchema.col("payload", "text", false)
             ).run();
             sessionDb.query().createTable(
@@ -807,8 +880,8 @@ public class ApiService {
                     TableSchema.col("remote_ip", "text", false),
                     TableSchema.col("key_set_id", "text", true),
                     TableSchema.col("active", "integer", false),
-                    TableSchema.col("started_at_ms", "integer", false),
-                    TableSchema.col("last_request_at_ms", "integer", false),
+                    TableSchema.col("started_at_ms", "bigint", false),
+                    TableSchema.col("last_request_at_ms", "bigint", false),
                     TableSchema.col("request_count", "integer", false),
                     TableSchema.col("payload", "text", false)
             ).run();
@@ -816,7 +889,7 @@ public class ApiService {
                     sessionKeysTable,
                     new TableSchema("id", "varchar(96)", false, true, null),
                     TableSchema.col("session_secret", "text", false),
-                    TableSchema.col("updated_at_ms", "integer", false),
+                    TableSchema.col("updated_at_ms", "bigint", false),
                     TableSchema.col("payload", "text", false)
             ).run();
             sessionDb.query().createTable(
@@ -824,7 +897,7 @@ public class ApiService {
                     TableSchema.id(),
                     TableSchema.col("entry_type", "text", false),
                     TableSchema.col("entry_value", "text", false),
-                    TableSchema.col("created_at_ms", "integer", false),
+                    TableSchema.col("created_at_ms", "bigint", false),
                     TableSchema.col("payload", "text", false)
             ).run();
             sessionDb.query().createTable(
@@ -832,8 +905,8 @@ public class ApiService {
                     TableSchema.id(),
                     TableSchema.col("entry_type", "text", false),
                     TableSchema.col("entry_value", "text", false),
-                    TableSchema.col("expires_at_ms", "integer", false),
-                    TableSchema.col("created_at_ms", "integer", false),
+                    TableSchema.col("expires_at_ms", "bigint", false),
+                    TableSchema.col("created_at_ms", "bigint", false),
                     TableSchema.col("payload", "text", false)
             ).run();
         } catch (Exception e) {
@@ -1042,8 +1115,9 @@ public class ApiService {
         return entry.getValue();
     }
 
-    private APIKeys managedApiKeys(String apiKey, String secret, String sessionSecret, String psk, List<IpAddress> allowedIps) {
-        return new APIKeys(apiKey, secret, sessionSecret, psk, allowedIps) {
+    private APIKeys managedApiKeys(String apiKey, String secret, String sessionSecret, String psk,
+                                   String sessionAllocationSecret, List<IpAddress> allowedIps) {
+        return new APIKeys(apiKey, secret, sessionSecret, psk, sessionAllocationSecret, allowedIps) {
             @Override
             public void updateSessionSecret(APIKeys keys, String sessionSecret) throws APIException {
                 ApiService.this.updateSessionSecret(keys, sessionSecret);
@@ -1051,12 +1125,14 @@ public class ApiService {
         };
     }
 
-    private void saveApiKeyRecord(String apiKey, String secret, String sessionSecret, String psk, List<IpAddress> allowedIps) throws APIException {
+    private void saveApiKeyRecord(String apiKey, String secret, String sessionSecret, String psk,
+                                  String sessionAllocationSecret, List<IpAddress> allowedIps) throws APIException {
         String id = apiKeyRecordId(apiKey);
         JSONObject payload = new JSONObject();
         payload.put("api_key", apiKey);
         payload.put("secret", secret);
         payload.put("session_secret", sessionSecret);
+        payload.put("session_allocation_secret", sessionAllocationSecret);
         payload.put("psk", psk);
         payload.put("allowed_ips", allowedIpsJson(allowedIps));
 
@@ -1072,6 +1148,16 @@ public class ApiService {
         JSONObject encrypted = getRecord(apiKeysTable, id);
         if(encrypted == null || encrypted.isEmpty()) return null;
         return decryptApiKeyPayload(id, encrypted);
+    }
+
+    private String existingAllocationSecret(String apiKey) {
+        if(!usesPersistentSessions() || apiKey == null || apiKey.isBlank()) return null;
+        try {
+            JSONObject payload = readApiKeyPayload(apiKey);
+            return payload == null ? null : stringValue(payload.get("session_allocation_secret"));
+        } catch (APIException ignored) {
+            return null;
+        }
     }
 
     private JSONObject encryptApiKeyPayload(String id, JSONObject payload) throws APIException {
@@ -1147,10 +1233,14 @@ public class ApiService {
         return allowedIps.isEmpty() ? null : allowedIps;
     }
 
-    private static void requireApiKeyMaterial(String apiKey, String secret, String sessionSecret, String psk) throws APIException {
+    private static void requireApiKeyMaterial(String apiKey, String secret, String sessionSecret, String psk,
+                                              String sessionAllocationSecret) throws APIException {
         if(apiKey == null || apiKey.isBlank()) throw new APIException("API key is required.");
         if(secret == null || secret.isBlank()) throw new APIException("API secret is required.");
         if(sessionSecret == null || sessionSecret.isBlank()) throw new APIException("API session secret is required.");
+        if(sessionAllocationSecret == null || sessionAllocationSecret.isBlank()) {
+            throw new APIException("API session allocation secret is required.");
+        }
         if(psk == null || psk.isBlank()) throw new APIException("API PSK is required.");
     }
 
@@ -1159,6 +1249,7 @@ public class ApiService {
                 && keys.getKey() != null && !keys.getKey().isBlank()
                 && keys.getSecret() != null && !keys.getSecret().isBlank()
                 && keys.getRawSessionSecret() != null && !keys.getRawSessionSecret().isBlank()
+                && keys.getRawSessionAllocationSecret() != null && !keys.getRawSessionAllocationSecret().isBlank()
                 && keys.getPsk() != null && !keys.getPsk().isBlank();
     }
 

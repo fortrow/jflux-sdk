@@ -30,7 +30,7 @@ import com.fortrow.jflux.db.connectors.details.DbConnectionRedisDetails;
 import com.fortrow.jflux.db.connectors.details.DbConnectionSqlLiteDetails;
 import com.fortrow.jflux.db.supporting.redis.RedisQuery;
 
-public class DbDriver {
+public class DbDriver implements AutoCloseable {
 
     private DbType type;
     private DbConnection connection;
@@ -69,5 +69,10 @@ public class DbDriver {
 
     public DbType getType() {
         return type;
+    }
+
+    @Override
+    public void close() throws Exception {
+        if(connection != null) connection.close();
     }
 }

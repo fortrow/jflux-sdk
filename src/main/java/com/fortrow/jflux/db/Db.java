@@ -33,7 +33,7 @@ import com.fortrow.jflux.db.supporting.SqlQuery;
 import com.fortrow.jflux.db.supporting.redis.RedisQuery;
 import com.fortrow.jflux.exceptions.types.CriticalException;
 
-public class Db {
+public class Db implements AutoCloseable {
 
     private DbDriver driver;
     private String database = null;
@@ -67,7 +67,11 @@ public class Db {
         try {
             setDatabase("" + dbIndex);
             return (RedisQuery) this.driver.buildQuery("" + dbIndex);
-        } catch (Exception | CriticalException e) { e.printStackTrace(); }
+        } catch (Exception e) {
+            new CriticalException("Failed to select Redis database.", e).report();
+        } catch (CriticalException e) {
+            e.report();
+        }
         return null;
     }
 
@@ -80,7 +84,11 @@ public class Db {
         try {
             setDatabase(database);
             return (SqlQuery) this.driver.buildQuery(dbName(database));
-        } catch (Exception | CriticalException e) { e.printStackTrace(); }
+        } catch (Exception e) {
+            new CriticalException("Failed to select database.", e).report();
+        } catch (CriticalException e) {
+            e.report();
+        }
         return null;
     }
 
@@ -90,6 +98,11 @@ public class Db {
 
     public DbDriver getRawDriver() {
         return this.driver;
+    }
+
+    @Override
+    public void close() throws Exception {
+        if(driver != null) driver.close();
     }
 
 }

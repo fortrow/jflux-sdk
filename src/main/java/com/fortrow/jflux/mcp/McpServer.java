@@ -30,7 +30,7 @@ public final class McpServer {
 
     public static final String PROTOCOL_VERSION = "2025-06-18";
     public static final String SERVER_NAME = "jflux-mcp";
-    public static final String SERVER_VERSION = "1.1.0";
+    public static final String SERVER_VERSION = "1.1.1";
 
     private static final int PARSE_ERROR = -32700;
     private static final int INVALID_REQUEST = -32600;

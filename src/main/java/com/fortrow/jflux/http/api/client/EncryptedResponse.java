@@ -66,7 +66,7 @@ public class EncryptedResponse {
         this.aad = aad;
         if(parseJson) this.data = parseObject(body);
         this.responseType = responseType;
-        if(responseType != EncryptedResponseType.SESSION_INIT) this.verified = verify(apiKey, secret, activeSecret, random, clientPrivate, serverPublic);
+        if(!isBootstrapResponse(responseType)) this.verified = verify(apiKey, secret, activeSecret, random, clientPrivate, serverPublic);
     }
 
     public EncryptedResponse(int status, ResponseHeaders headers, String body, String apiKey, String secret, String activeSecret, String random, PublicKey serverPublic, PrivateKey clientPrivate, EncryptedResponseType responseType) {
@@ -82,7 +82,7 @@ public class EncryptedResponse {
         Object responseValue = data.get("response");
         this.ciphertext = responseValue instanceof String ? (String) responseValue : null;
         this.responseType = responseType;
-        if(responseType != EncryptedResponseType.SESSION_INIT) {
+        if(!isBootstrapResponse(responseType)) {
             this.verified = verify(apiKey, secret, activeSecret, random, clientPrivate, serverPublic);
             if (this.verified) {
                 try {
@@ -120,6 +120,10 @@ public class EncryptedResponse {
     public String nextRandom() { return this.nextIv; }
     public String nextSecretKey() { return this.nextSecretKey; }
     public String currentSecretKey() { return this.currentSecretKey; }
+
+    private static boolean isBootstrapResponse(EncryptedResponseType type) {
+        return type == EncryptedResponseType.SESSION_INIT || type == EncryptedResponseType.SESSION_RESUME;
+    }
 
     private static JSONObject parseObject(String body) {
         if (body == null || body.isBlank()) return new JSONObject();

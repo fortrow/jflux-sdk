@@ -229,19 +229,19 @@ public class Schema {
                     "AND `COLUMNS`.`TABLE_NAME`=? " +
                     "ORDER BY `COLUMNS`.`ORDINAL_POSITION` ASC";
             connection.changeDb("INFORMATION_SCHEMA");
-            PreparedStatement stmt = conn(connection).prepareStatement(sql);
-            stmt.setString(1, db);
-            stmt.setString(2, table);
-            ResultSet rs = stmt.executeQuery();
             ArrayList<String> cols = new ArrayList<>();
-            while (rs.next()) {
-                cols.add(rs.getString("COLUMN_NAME"));
+            try(PreparedStatement stmt = conn(connection).prepareStatement(sql)) {
+                stmt.setString(1, db);
+                stmt.setString(2, table);
+                try(ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) cols.add(rs.getString("COLUMN_NAME"));
+                }
             }
             String[] arr = new String[cols.size()];
             cols.toArray(arr);
             return arr;
         } catch(Exception e) {
-            e.printStackTrace();
+            new CriticalException("Failed to read database columns.", e).report();
             return new String[0];
         } catch (CriticalException e) {
             throw new RuntimeException(e);
@@ -257,8 +257,9 @@ public class Schema {
         for(int i=0; i<res.size(); i++) {
             String table = __.str(res.next().val("TABLE_NAME"));
             String sql = "DROP TABLE " + table;
-            Statement stmt = conn(connection).createStatement();
-            stmt.executeUpdate(sql);
+            try(Statement stmt = conn(connection).createStatement()) {
+                stmt.executeUpdate(sql);
+            }
             updates++;
         }
         table(database, connection, db, name, migration);
@@ -270,8 +271,9 @@ public class Schema {
     public static int table(Db database, DbConnection connection, String db, String name, ArrayList<ColumnProperties> migration) throws Exception, CriticalException {
         __.printPrettyLn("Creating table '" + name + "' in database '" + db + "' ...");
         String preparedSql = "CREATE TABLE IF NOT EXISTS " + name + " (temp int)";
-        Statement stmt = conn(connection).createStatement();
-        stmt.executeUpdate(preparedSql);
+        try(Statement stmt = conn(connection).createStatement()) {
+            stmt.executeUpdate(preparedSql);
+        }
 
         checkForReplacements(connection, db, name, getProperties(database, db, name), migration);
 
@@ -301,8 +303,9 @@ public class Schema {
         if(props.isPrimaryKey()) sql += "PRIMARY KEY";
         else if(!props.isNullable()) sql += "NOT NULL";
         if(__.isset(props.getColumnDefault())) sql += " DEFAULT '" + props.getColumnDefault() + "'";
-        Statement stmt = conn(connection).createStatement();
-        stmt.execute(sql);
+        try(Statement stmt = conn(connection).createStatement()) {
+            stmt.execute(sql);
+        }
         __.printPrettyLn("Column '" + props.getName() + "' created successfully!", __.TextColor.PURPLE);
         updates++;
     }
@@ -339,8 +342,9 @@ public class Schema {
             for(ColumnProperties properties : removals) {
                 __.printPrettyLn("Deleting column '" + properties.getName() + "' from table '" + table + "'..");
                 connection.changeDb(db);
-                Statement stmt = conn(connection).createStatement();
-                stmt.executeUpdate("ALTER TABLE " + table + " DROP COLUMN " + properties.getName());
+                try(Statement stmt = conn(connection).createStatement()) {
+                    stmt.executeUpdate("ALTER TABLE " + table + " DROP COLUMN " + properties.getName());
+                }
                 __.printPrettyLn("Column deleted successfully!", __.TextColor.PURPLE);
             }
             updates++;
@@ -362,15 +366,17 @@ public class Schema {
                     int selection = __.num(scnr.nextLine());
                     if(selection == 0) {
                         __.printPrettyLn("Deleting column '" + removals.get(i).getName() + "' from table '" + table + "'..");
-                        Statement stmt = conn(connection).createStatement();
-                        stmt.executeUpdate("ALTER TABLE " + table + " DROP COLUMN " + removals.get(i).getName());
+                        try(Statement stmt = conn(connection).createStatement()) {
+                            stmt.executeUpdate("ALTER TABLE " + table + " DROP COLUMN " + removals.get(i).getName());
+                        }
                         __.printPrettyLn("Column deleted successfully!", __.TextColor.PURPLE);
                     } else {
                         int index = selection - 1;
                         if(index >= replacements.size()) break;
                         __.printPrettyLn("Renaming column '" + removals.get(i).getName() + "' to '" + replacements.get(index).getName() + "' from table '" + table + "'..");
-                        Statement stmt = conn(connection).createStatement();
-                        stmt.executeUpdate("ALTER TABLE " + table + " RENAME COLUMN " + removals.get(i).getName() + " to " + replacements.get(index).getName());
+                        try(Statement stmt = conn(connection).createStatement()) {
+                            stmt.executeUpdate("ALTER TABLE " + table + " RENAME COLUMN " + removals.get(i).getName() + " to " + replacements.get(index).getName());
+                        }
                         replacements.remove(index);
                         __.printPrettyLn("Column renamed successfully!", __.TextColor.PURPLE);
                     }
@@ -392,8 +398,9 @@ public class Schema {
             if(passed.isPrimaryKey()) sql += "PRIMARY KEY";
             else if(!passed.isNullable()) sql += "NOT NULL";
             if(__.isset(passed.getColumnDefault())) sql += " DEFAULT '" + passed.getColumnDefault() + "'";
-            Statement stmt = conn(connection).createStatement();
-            stmt.executeUpdate(sql);
+            try(Statement stmt = conn(connection).createStatement()) {
+                stmt.executeUpdate(sql);
+            }
             __.printPrettyLn("Column '" + passed.getName() + "' updated successfully!", __.TextColor.PURPLE);
             updates++;
         }

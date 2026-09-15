@@ -24,6 +24,7 @@ package com.fortrow.jflux.http.api.types;
 public enum EncryptedResponseType {
 
     SESSION_INIT,
+    SESSION_RESUME,
     KEY_TRANSFER,
     EXECUTE_RESOURCE,
     SESSION_CLOSE

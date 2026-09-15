@@ -76,8 +76,7 @@ public class Condition {
     }
 
     public Condition(boolean closeGroup) {
-        if(closeGroup) groupIndex = 1;
-        groupIndex = -1;
+        groupIndex = closeGroup ? 1 : -1;
     }
 
     public static Condition GROUP_BEGIN() {

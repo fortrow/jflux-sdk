@@ -53,6 +53,10 @@ public class Field {
         return name();
     }
 
+    public ColumnOrFunction key() {
+        return key;
+    }
+
     public <Any> Any get() {
         if(value == null) return null;
         if(value.getClass() == String.class) return (Any) ((String) value);

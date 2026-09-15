@@ -6,7 +6,7 @@
 
     <groupId>com.fortrow</groupId>
     <artifactId>jflux</artifactId>
-    <version>1.1.0</version>
+    <version>1.1.1</version>
 
     <properties>
         <maven.compiler.source>23</maven.compiler.source>
@@ -217,6 +217,8 @@
                                     <include>com.jsoftbiz:os-platform-finder</include>
                                     <include>org.slf4j:slf4j-api</include>
                                     <include>org.slf4j:slf4j-nop</include>
+                                    <include>de.siegmar:fastcsv</include>
+                                    <include>org.snakeyaml:snakeyaml-engine</include>
                                 </includes>
                             </artifactSet>
                             <filters>
@@ -224,21 +226,27 @@
                                     <artifact>com.fortrow:jflux</artifact>
                                     <includes>
                                         <include>com/fortrow/jflux/console/**</include>
+                                        <include>com/fortrow/jflux/ctl/**</include>
                                         <include>com/fortrow/jflux/crypto/**</include>
                                         <include>com/fortrow/jflux/encoding/**</include>
+                                        <include>com/fortrow/jflux/email/**</include>
                                         <include>com/fortrow/jflux/exceptions/**</include>
                                         <include>com/fortrow/jflux/files/**</include>
                                         <include>com/fortrow/jflux/mcp/**</include>
                                         <include>com/fortrow/jflux/json/**</include>
+                                        <include>com/fortrow/jflux/jni/**</include>
                                         <include>com/fortrow/jflux/shell/**</include>
                                         <include>com/fortrow/jflux/sockets/**</include>
                                         <include>com/fortrow/jflux/stdout/**</include>
                                         <include>com/fortrow/jflux/sys/**</include>
                                         <include>com/fortrow/jflux/todash/**</include>
                                         <include>com/fortrow/jflux/threading/**</include>
-                                        <include>com/fortrow/jflux/runtime/lib/**</include>
+                                        <include>com/fortrow/jflux/runtime/**</include>
                                         <include>com/fortrow/jflux/regex/**</include>
-                                        <include>com/fortrow/jflux/output/json/**</include>
+                                        <include>com/fortrow/jflux/output/**</include>
+                                        <include>com/fortrow/jflux/csv/**</include>
+                                        <include>com/fortrow/jflux/xml/**</include>
+                                        <include>com/fortrow/jflux/yaml/**</include>
                                     </includes>
                                 </filter>
                                 <filter>
@@ -284,6 +292,7 @@
                                         <include>com/fortrow/jflux/console/**</include>
                                         <include>com/fortrow/jflux/crypto/**</include>
                                         <include>com/fortrow/jflux/encoding/**</include>
+                                        <include>com/fortrow/jflux/email/**</include>
                                         <include>com/fortrow/jflux/exceptions/**</include>
                                         <include>com/fortrow/jflux/files/**</include>
                                         <include>com/fortrow/jflux/json/**</include>
@@ -294,7 +303,7 @@
                                         <include>com/fortrow/jflux/todash/**</include>
                                         <include>com/fortrow/jflux/db/**</include>
                                         <include>com/fortrow/jflux/threading/**</include>
-                                        <include>com/fortrow/jflux/runtime/lib/**</include>
+                                        <include>com/fortrow/jflux/runtime/**</include>
                                         <include>com/fortrow/jflux/regex/**</include>
                                         <include>com/fortrow/jflux/output/json/**</include>
                                     </includes>
@@ -335,6 +344,7 @@
                                     <include>org.xerial:sqlite-jdbc</include>
                                     <include>org.apache.httpcomponents:httpclient</include>
                                     <include>org.apache.httpcomponents:httpcore</include>
+                                    <include>org.java-websocket:Java-WebSocket</include>
                                     <include>commons-logging:commons-logging</include>
                                     <include>commons-codec:commons-codec</include>
                                     <include>com.google.guava:guava</include>
@@ -349,6 +359,7 @@
                                         <include>com/fortrow/jflux/console/**</include>
                                         <include>com/fortrow/jflux/crypto/**</include>
                                         <include>com/fortrow/jflux/encoding/**</include>
+                                        <include>com/fortrow/jflux/email/**</include>
                                         <include>com/fortrow/jflux/exceptions/**</include>
                                         <include>com/fortrow/jflux/files/**</include>
                                         <include>com/fortrow/jflux/json/**</include>
@@ -359,9 +370,10 @@
                                         <include>com/fortrow/jflux/todash/**</include>
                                         <include>com/fortrow/jflux/db/**</include>
                                         <include>com/fortrow/jflux/http/**</include>
+                                        <include>com/fortrow/jflux/websockets/**</include>
                                         <include>com/fortrow/jflux/ssl/**</include>
                                         <include>com/fortrow/jflux/threading/**</include>
-                                        <include>com/fortrow/jflux/runtime/lib/**</include>
+                                        <include>com/fortrow/jflux/runtime/**</include>
                                         <include>com/fortrow/jflux/regex/**</include>
                                         <include>com/fortrow/jflux/output/json/**</include>
                                     </includes>

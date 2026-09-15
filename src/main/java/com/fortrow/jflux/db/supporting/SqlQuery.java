@@ -27,7 +27,9 @@ import com.fortrow.jflux.exceptions.types.CommonException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class SqlQuery implements Query {
 
@@ -40,6 +42,16 @@ public class SqlQuery implements Query {
     private ArrayList<Condition> where = new ArrayList<Condition>();
     private ArrayList<Join> join = new ArrayList<Join>();
     private HashMap<String, ArrayList<TableSchema>> createTable = new HashMap<>();
+    private List<Map<String, Object>> insertRows;
+    private String pragma;
+    private Object pragmaValue;
+    private boolean pragmaRead;
+    private boolean distinct;
+    private int limit = -1;
+    private int offset = -1;
+    private ArrayList<Condition> having = new ArrayList<>();
+    private ArrayList<Field> returning = new ArrayList<>();
+    private boolean insertIgnore;
 
     private boolean delete = false;
     private boolean softDelete = false;
@@ -111,6 +123,26 @@ public class SqlQuery implements Query {
         return this;
     }
 
+    /** Accepts any map implementation while retaining the original HashMap overload. */
+    public SqlQuery insert(Map<String, Object> toInsert) {
+        if(toInsert == null) return this;
+        for(Map.Entry<String, Object> entry : toInsert.entrySet()) insert(entry.getKey(), entry.getValue());
+        return this;
+    }
+
+    /** Inserts multiple rows in one prepared statement. Every row must use the same columns. */
+    public SqlQuery insertBatch(List<? extends Map<String, Object>> rows) {
+        if(rows == null || rows.isEmpty()) return this;
+        ArrayList<Map<String, Object>> copy = new ArrayList<>(rows.size());
+        for(Map<String, Object> row : rows) {
+            if(row == null || row.isEmpty()) throw new IllegalArgumentException("Insert rows cannot be null or empty.");
+            copy.add(new LinkedHashMap<>(row));
+        }
+        this.insertRows = copy;
+        this.insert(copy.get(0));
+        return this;
+    }
+
     public SqlQuery insert(String column, Object value) {
 
         Field field = new Field(makeColumn(column), value);
@@ -125,6 +157,13 @@ public class SqlQuery implements Query {
             update(key, value);
         }
 
+        return this;
+    }
+
+    /** Accepts any map implementation while retaining the original HashMap overload. */
+    public SqlQuery update(Map<String, Object> toUpdate) {
+        if(toUpdate == null) return this;
+        for(Map.Entry<String, Object> entry : toUpdate.entrySet()) update(entry.getKey(), entry.getValue());
         return this;
     }
 
@@ -323,6 +362,59 @@ public class SqlQuery implements Query {
         return this;
     }
 
+    public SqlQuery having(String column, String operator, Object value) {
+        try {
+            Condition condition = new Condition(makeColumn(column), Operator.parse(operator), value);
+            having.add(condition);
+        } catch (CommonException e) {
+            throw new IllegalArgumentException("Invalid HAVING condition", e);
+        }
+        return this;
+    }
+
+    public SqlQuery distinct() {
+        this.distinct = true;
+        return this;
+    }
+
+    public SqlQuery limit(int limit) {
+        if(limit < 0) throw new IllegalArgumentException("LIMIT cannot be negative.");
+        this.limit = limit;
+        return this;
+    }
+
+    public SqlQuery offset(int offset) {
+        if(offset < 0) throw new IllegalArgumentException("OFFSET cannot be negative.");
+        this.offset = offset;
+        return this;
+    }
+
+    public SqlQuery returning(String... columns) {
+        for(String column : columns) returning.add(new Field(makeColumn(column), null));
+        return this;
+    }
+
+    public SqlQuery insertIgnore() {
+        this.insertIgnore = true;
+        return this;
+    }
+
+    /** Reads a SQLite PRAGMA, for example {@code pragma("foreign_keys")}. */
+    public SqlQuery pragma(String name) {
+        this.pragma = validatePragmaName(name);
+        this.pragmaValue = null;
+        this.pragmaRead = true;
+        return this;
+    }
+
+    /** Sets a SQLite PRAGMA, for example {@code pragma("busy_timeout", 5000)}. */
+    public SqlQuery pragma(String name, Object value) {
+        this.pragma = validatePragmaName(name);
+        this.pragmaValue = value;
+        this.pragmaRead = false;
+        return this;
+    }
+
     public SqlQuery allRows() {
         addWhere(new Condition("1"));
         return this;
@@ -383,7 +475,7 @@ public class SqlQuery implements Query {
     }
 
     private String makeTable(String input) {
-        return "`" + table + "`";
+        return "`" + stripColumnChars(input) + "`";
     }
 
     @Override
@@ -402,8 +494,25 @@ public class SqlQuery implements Query {
                 where,
                 join,
                 createTable,
-                setTimestamps
+                setTimestamps,
+                insertRows,
+                pragma,
+                pragmaValue,
+                pragmaRead,
+                distinct,
+                limit,
+                offset,
+                having,
+                returning,
+                insertIgnore
         );
+    }
+
+    private String validatePragmaName(String name) {
+        if(name == null || !name.matches("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?")) {
+            throw new IllegalArgumentException("Invalid SQLite PRAGMA name.");
+        }
+        return name;
     }
 
 }

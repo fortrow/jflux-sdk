@@ -27,11 +27,11 @@ import com.fortrow.jflux.db.supporting.sql.Record;
 import com.fortrow.jflux.db.supporting.sql.ColumnOrFunction;
 import com.fortrow.jflux.exceptions.types.CriticalException;
 import com.fortrow.jflux.json.JSON;
-import org.checkerframework.checker.units.qual.A;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.util.ArrayList;
 import java.util.Map;
 
@@ -42,10 +42,14 @@ public class QueryResults {
 
     public QueryResults(ResultSet rs, ArrayList<Field> select, String table) {
         try {
+            ResultSetMetaData metadata = rs.getMetaData();
             while(rs.next()) {
                 ArrayList<Field> fields = new ArrayList<Field>();
-                for(int i=0; i<select.size(); i++) {
-                    ColumnOrFunction col = select.get(i).column();
+                int count = select == null || select.isEmpty() ? metadata.getColumnCount() : select.size();
+                for(int i=0; i<count; i++) {
+                    ColumnOrFunction col = select != null && !select.isEmpty()
+                            ? select.get(i).key()
+                            : new com.fortrow.jflux.db.supporting.sql.Column(table, metadata.getColumnLabel(i + 1));
                     fields.add(new Field(col, rs.getObject(i + 1)));
                 }
                 records.add(new Record(fields, table));

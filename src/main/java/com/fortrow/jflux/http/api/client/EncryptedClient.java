@@ -31,6 +31,7 @@ import com.fortrow.jflux.exceptions.ExceptionHandling;
 import com.fortrow.jflux.http.api.server.config.HttpVersion;
 import com.fortrow.jflux.http.api.server.exceptions.APIException;
 import com.fortrow.jflux.http.api.server.encryption.APIKeys;
+import com.fortrow.jflux.http.api.server.session.SessionAllocationAssertion;
 import com.fortrow.jflux.http.api.types.EncryptedResponseType;
 import com.fortrow.jflux.output.json.JSON;
 import com.fortrow.jflux.todash.__;
@@ -92,8 +93,13 @@ public class EncryptedClient implements AutoCloseable {
     private String nextSessionAuthorization = "";
     private String sessionInitPath = "";
     private String sessionClosePath = "";
+    private String sessionResumePath = "/session/resume";
+    private String sessionResetPath = "/session/reset";
+    private String sessionAllocatePath = "/session/allocate";
+    private String sessionHeartbeatPath = "/session/heartbeat";
     private String responsePath = "/response";
     private SecretStore sessionSecretStore;
+    private SecretStore resumeTokenStore = new StringSecretStore("");
     private int asyncTimeoutMs = DEFAULT_ASYNC_TIMEOUT_MS;
     private String lastSessionInitError = "";
 
@@ -226,6 +232,31 @@ public class EncryptedClient implements AutoCloseable {
         return this;
     }
 
+    public EncryptedClient setResumeTokenStore(SecretStore resumeTokenStore) {
+        this.resumeTokenStore = Objects.requireNonNull(resumeTokenStore, "Resume-token store is required.");
+        return this;
+    }
+
+    public EncryptedClient setResumeTokenFile(File file) {
+        if (file == null) throw ExceptionHandling.invalid("Resume-token file is required.");
+        return setResumeTokenStore(new FileSecretStore(file.toPath()));
+    }
+
+    public EncryptedClient setSessionResumePath(String path) {
+        this.sessionResumePath = fixPath(path);
+        return this;
+    }
+
+    public EncryptedClient setSessionResetPath(String path) {
+        this.sessionResetPath = fixPath(path);
+        return this;
+    }
+
+    public EncryptedClient setSessionAllocatePath(String path) {
+        this.sessionAllocatePath = fixPath(path);
+        return this;
+    }
+
     public EncryptedClient setHttp3UpgradeUri(String upgradeUri) {
         this.http3UpgradeUri = stripTrailingSlash(upgradeUri);
         return this;
@@ -251,8 +282,12 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     public boolean closeSession() {
+        return closeSession(false);
+    }
+
+    public boolean closeSession(boolean createResumeToken) {
         try {
-            closeSessionOrThrow();
+            closeSessionOrThrow(createResumeToken);
             return true;
         } catch (APIException ignored) {
             return false;
@@ -278,10 +313,16 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     public EncryptedResponse closeSessionOrThrow() throws APIException {
+        return closeSessionOrThrow(false);
+    }
+
+    public EncryptedResponse closeSessionOrThrow(boolean createResumeToken) throws APIException {
         if(!hasActiveSession()) throw new APIException("Encrypted session has not been initialized.");
         if(sessionClosePath == null || sessionClosePath.isBlank()) throw new APIException("Encrypted session close path is not configured.");
 
-        EncryptedResponse response = request(sessionClosePath, new JSONObject(), EncryptedResponseType.SESSION_CLOSE, false);
+        JSONObject closeBody = new JSONObject();
+        if (createResumeToken) closeBody.put("create_resume_token", true);
+        EncryptedResponse response = request(sessionClosePath, closeBody, EncryptedResponseType.SESSION_CLOSE, false);
         if(response == null) throw new APIException("No response was returned from session close.");
         if(response.getStatus() != 200 || !"success".equals(response.getRequestStatus())) {
             throw new APIException("Encrypted session close was not successful. status=" + response.getStatus() + ", body=" + response.getBody());
@@ -289,7 +330,46 @@ public class EncryptedClient implements AutoCloseable {
         if(!response.isVerified()) throw new APIException("Encrypted session close response authorization failed.");
 
         persistAuthenticatedSessionSecret(this.pastSecret);
+        if (createResumeToken) {
+            String resumeToken = stringValue(response.getBodyObject().get("resume_token"));
+            if (resumeToken.isBlank()) {
+                clearSessionState();
+                throw new APIException("Session close did not return the requested resume token.");
+            }
+            try {
+                resumeTokenStore.write(resumeToken);
+            } catch (RuntimeException ex) {
+                clearSessionState();
+                throw new APIException("Unable to persist the encrypted session resume token.", ex);
+            }
+        } else {
+            clearResumeToken();
+        }
+
         clearSessionState();
+        return response;
+    }
+
+    /** Sends an authenticated encrypted heartbeat without closing the session. */
+    public EncryptedResponse heartbeat() throws APIException {
+        return heartbeat(false);
+    }
+
+    /** Requests an early resume token only when the server permits issuance. */
+    public EncryptedResponse heartbeat(boolean createResumeToken) throws APIException {
+        if(sessionHeartbeatPath == null || sessionHeartbeatPath.isBlank()) {
+            throw new APIException("Encrypted session heartbeat path is not configured.");
+        }
+        JSONObject body = new JSONObject();
+        if (createResumeToken) body.put("create_resume_token", true);
+        EncryptedResponse response = request(sessionHeartbeatPath, body);
+        if (createResumeToken) {
+            if (response == null || response.getStatus() != 200 || !response.isVerified())
+                throw new APIException("Early resume token request failed.");
+            String token = stringValue(response.getBodyObject().get("resume_token"));
+            if (token.isBlank()) throw new APIException("Server did not issue an early resume token.");
+            resumeTokenStore.write(token);
+        }
         return response;
     }
 
@@ -419,6 +499,68 @@ public class EncryptedClient implements AutoCloseable {
         throw new APIException("Timed out waiting for encrypted async response.");
     }
 
+    /** Requests a one-time challenge for the external authentication backend. */
+    public JSONObject requestAllocationChallenge() throws APIException {
+        return allocationControl(new JSONObject());
+    }
+
+    /**
+     * Submits the external authentication backend's signed assertion. Every
+     * accepted assertion increases this API key's capacity by exactly one.
+     */
+    public JSONObject allocateSession(SessionAllocationAssertion assertion) throws APIException {
+        if (assertion == null) throw new APIException("Session allocation assertion is required.");
+        return allocationControl(assertion.toJson());
+    }
+
+    /** Convenience overload for clients that receive the assertion as flat fields. */
+    public JSONObject allocateSession(String challengeId, String challenge,
+                                     long issuedAtMs, long expiresAtMs, String signature) throws APIException {
+        return allocateSession(new SessionAllocationAssertion(
+                apiKey, challengeId, challenge, issuedAtMs, expiresAtMs, signature));
+    }
+
+    /** @deprecated JFlux no longer receives username/password/MFA values. */
+    @Deprecated
+    public JSONObject requestAllocationChallenge(String ignoredUsername) throws APIException {
+        return requestAllocationChallenge();
+    }
+
+    /** @deprecated Authenticate users in the external web-authentication backend and submit a signed assertion. */
+    @Deprecated
+    public JSONObject authenticateAllocation(String username, String challengeId, String challenge,
+                                             String challengeResponse, String mfaResponse) throws APIException {
+        throw new APIException("JFlux does not receive username, password, or MFA values. Submit a signed session allocation assertion.");
+    }
+
+    /** @deprecated Allocation accepts one signed assertion and always adds one session slot. */
+    @Deprecated
+    public JSONObject allocateSessions(String oauthToken, int additionalSessions) throws APIException {
+        throw new APIException("OAuth-style allocation tokens are no longer supported. Submit a signed session allocation assertion.");
+    }
+
+    /** Invalidates this API key's sessions/tokens and restores its capacity to one. */
+    public JSONObject resetSessions() throws APIException {
+        JSONObject response = allocationControl(new JSONObject(), sessionResetPath);
+        if ("success".equals(stringValue(response.get("request_status")))) clearResumeToken();
+        return response;
+    }
+
+    public static boolean isSessionLimitReached(JSONObject response) {
+        return response != null && "JFLUX_SESSION_LIMIT_REACHED".equals(stringValue(response.get("error_code")));
+    }
+
+    private JSONObject allocationControl(JSONObject body) throws APIException {
+        return allocationControl(body, sessionAllocatePath);
+    }
+
+    private JSONObject allocationControl(JSONObject body, String path) throws APIException {
+        EncryptedResponse response = postBootstrap(fixPath(path), body, EncryptedResponseType.SESSION_RESUME);
+        JSONObject result = response == null ? new JSONObject() : response.getBodyObject();
+        if (result.isEmpty() && response != null && response.getData() != null) result = response.getData();
+        return result;
+    }
+
 
     private static String normalizeResourceMethod(RequestType resourceMethod) {
         return resourceMethod == null ? RequestType.POST.name() : resourceMethod.name();
@@ -435,13 +577,31 @@ public class EncryptedClient implements AutoCloseable {
 
     public boolean beginSession(String sessionInitPath, String sessionClosePath) {
 
+        return beginSession(sessionInitPath, sessionClosePath, "/session/resume", "/session/reset", "/session/allocate");
+    }
+
+    public boolean beginSession(String sessionInitPath, String sessionClosePath,
+                                String sessionResumePath, String sessionResetPath,
+                                String sessionAllocatePath) {
+        return beginSession(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath, "/session/heartbeat");
+    }
+
+    public boolean beginSession(String sessionInitPath, String sessionClosePath,
+                                String sessionResumePath, String sessionResetPath,
+                                String sessionAllocatePath, String sessionHeartbeatPath) {
+
         if(sessionInitPath == null || sessionInitPath.isBlank()) throw ExceptionHandling.invalid("Encrypted session init path is required.");
         if(sessionClosePath == null || sessionClosePath.isBlank()) throw ExceptionHandling.invalid("Encrypted session close path is required.");
 
         this.sessionInitPath = fixPath(sessionInitPath);
         this.sessionClosePath = fixPath(sessionClosePath);
+        this.sessionResumePath = fixPath(sessionResumePath);
+        this.sessionResetPath = fixPath(sessionResetPath);
+        this.sessionAllocatePath = fixPath(sessionAllocatePath);
+        this.sessionHeartbeatPath = fixPath(sessionHeartbeatPath);
         this.sessionSecret = SHA.get256(currentRawSessionSecret());
 
+        if (!readOptionalSecret(resumeTokenStore).isBlank() && resume()) return true;
         return init();
 
     }
@@ -453,7 +613,29 @@ public class EncryptedClient implements AutoCloseable {
         }
     }
 
+    public void beginSessionOrThrow(String sessionInitPath, String sessionClosePath,
+                                    String sessionResumePath, String sessionResetPath,
+                                    String sessionAllocatePath) throws APIException {
+        if(!beginSession(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath)) {
+            String detail = lastSessionInitError == null || lastSessionInitError.isBlank() ? "No session detail was captured." : lastSessionInitError;
+            throw new APIException("Failed to begin encrypted API session: " + detail);
+        }
+    }
+
+    public void beginSessionOrThrow(String sessionInitPath, String sessionClosePath,
+                                    String sessionResumePath, String sessionResetPath,
+                                    String sessionAllocatePath, String sessionHeartbeatPath) throws APIException {
+        if(!beginSession(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath, sessionHeartbeatPath)) {
+            String detail = lastSessionInitError == null || lastSessionInitError.isBlank() ? "No session detail was captured." : lastSessionInitError;
+            throw new APIException("Failed to begin encrypted API session: " + detail);
+        }
+    }
+
     private EncryptedResponse get(String path, HashMap<String, String> requestHeaders) throws APIException {
+        return get(path, requestHeaders, EncryptedResponseType.SESSION_INIT);
+    }
+
+    private EncryptedResponse get(String path, HashMap<String, String> requestHeaders, EncryptedResponseType responseType) throws APIException {
 
         try {
 
@@ -468,14 +650,54 @@ public class EncryptedClient implements AutoCloseable {
 
             httpRequest.execute();
 
-            return new EncryptedResponse(httpRequest.getStatus(), httpRequest.getHeaders(), httpRequest.getBody(), this.apiKey, this.secret, this.activeSecret, this.sessionRandom, serverPublic, clientPrivate, EncryptedResponseType.SESSION_INIT, true);
+            return new EncryptedResponse(httpRequest.getStatus(), httpRequest.getHeaders(), httpRequest.getBody(), this.apiKey, this.secret, this.activeSecret, this.sessionRandom, serverPublic, clientPrivate, responseType, true);
 
         } catch (APIException e) {
             throw e;
         } catch (Exception e) {
-            throw new APIException("Encrypted API session-init transport failed.", e);
+            throw new APIException("Encrypted API bootstrap transport failed.", e);
         }
 
+    }
+
+    private EncryptedResponse postBootstrap(String path, JSONObject body, EncryptedResponseType responseType) throws APIException {
+        HashMap<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("X-Api-Key", apiKey);
+        String randomBytes = getRandomBytes(44);
+        headers.put("X-Api-Random-Bytes", randomBytes);
+        headers.put("X-Api-Session-Authorization", sessionSecret);
+        return postBootstrap(path, body, responseType, headers);
+    }
+
+    private EncryptedResponse postBootstrap(String path, JSONObject body, EncryptedResponseType responseType,
+                                            HashMap<String, String> headers) throws APIException {
+        try {
+            headers.putIfAbsent("X-Request-Timestamp", Long.toString(System.currentTimeMillis() / 1000));
+            if (fixPath(path).equals(sessionResetPath)) {
+                String timestamp = headers.get("X-Request-Timestamp");
+                String randomBytes = headers.get("X-Api-Random-Bytes");
+                headers.put("X-Api-Reset-Authorization",
+                        APIKeys.sessionResetAuthorization(secret, apiKey, timestamp, randomBytes));
+            }
+            String requestBody = JSON.getString(body == null ? new JSONObject() : body);
+            HttpEntity entity = new StringEntity(requestBody);
+            ExecutesClientRequest httpRequest;
+            if(httpVersion == HttpVersion.HTTP_1) {
+                if(http1Client == null) throw new APIException("Encrypted HTTP/1 client has not been built.");
+                httpRequest = new Http1Request(http1Client, this.endpointUri + path, RequestType.POST, headers, entity);
+            } else if(httpVersion == HttpVersion.HTTP_3) {
+                if(http3Client == null) throw new APIException("Encrypted HTTP/3 client has not been built.");
+                httpRequest = new Http3Request(http3Client, this.endpointUri + path, RequestType.POST, headers, requestBody);
+            } else throw new APIException("Encrypted HTTP version is not supported.");
+            httpRequest.execute();
+            return new EncryptedResponse(httpRequest.getStatus(), httpRequest.getHeaders(), httpRequest.getBody(),
+                    apiKey, secret, activeSecret, sessionRandom, serverPublic, clientPrivate, responseType, null);
+        } catch (APIException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new APIException("Encrypted API bootstrap transport failed.", e);
+        }
     }
 
     private EncryptedResponse post(String path, String encryptedRequest, HashMap<String, String> requestHeaders, byte[] aad, EncryptedResponseType responseType, boolean updateRequestVars) throws APIException {
@@ -522,6 +744,7 @@ public class EncryptedClient implements AutoCloseable {
         headers.put("Content-Type", "application/json");
         headers.put("X-Api-Key", apiKey);
         headers.put("X-Api-Random-Bytes", randomBytesHex);
+        headers.put("X-Request-Timestamp", Long.toString(System.currentTimeMillis() / 1000));
         headers.put("X-Api-Session-Authorization", sessionSecret);
 
         sessionRandom = randomBytesHex.substring(0, 64);
@@ -529,34 +752,71 @@ public class EncryptedClient implements AutoCloseable {
         lastSessionInitError = "";
         EncryptedResponse response;
         try {
-            response = get(this.sessionInitPath, headers);
+            response = get(this.sessionInitPath, headers, EncryptedResponseType.SESSION_INIT);
         } catch (APIException e) {
             lastSessionInitError = e.getMessage();
             return false;
         }
 
+        return finishBootstrap(response, "Session init");
+
+    }
+
+    private boolean resume() {
+        String token = readOptionalSecret(resumeTokenStore);
+        if (token.isBlank()) return false;
+        String randomBytesHex = getRandomBytes(44);
+        sessionRandom = randomBytesHex.substring(0, 64);
+        JSONObject body = new JSONObject();
+        body.put("resume_token", token);
+        HashMap<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("X-Api-Key", apiKey);
+        headers.put("X-Api-Random-Bytes", randomBytesHex);
+        headers.put("X-Request-Timestamp", Long.toString(System.currentTimeMillis() / 1000));
+        headers.put("X-Api-Session-Authorization", sessionSecret);
+        lastSessionInitError = "";
+        EncryptedResponse response;
+        try {
+            response = postBootstrap(sessionResumePath, body, EncryptedResponseType.SESSION_RESUME, headers);
+        } catch (APIException e) {
+            lastSessionInitError = e.getMessage();
+            return false;
+        }
+        if (!finishBootstrap(response, "Session resume")) return false;
+        clearResumeToken();
+        return true;
+    }
+
+    private boolean finishBootstrap(EncryptedResponse response, String label) {
         if(response == null) {
-            lastSessionInitError = "No response was returned from session init.";
+            lastSessionInitError = "No response was returned from " + label.toLowerCase() + ".";
             return false;
         }
         if(response.getData() == null || !response.getData().containsKey("request_status")) {
-            lastSessionInitError = "Session init response did not include request_status. status=" + response.getStatus() + ", body=" + response.getBody();
+            lastSessionInitError = label + " response did not include request_status. status=" + response.getStatus() + ", body=" + response.getBody();
             return false;
         }
-        if(!"success".equals((String) response.getData().get("request_status"))) {
-            lastSessionInitError = "Session init was not successful. status=" + response.getStatus() + ", body=" + response.getBody();
+        if(!"success".equals(String.valueOf(response.getData().get("request_status")))) {
+            lastSessionInitError = label + " was not successful. status=" + response.getStatus() + ", body=" + response.getBody();
             return false;
         }
         if(!response.getData().containsKey("iv")) {
-            lastSessionInitError = "Session init response did not include iv. status=" + response.getStatus() + ", body=" + response.getBody();
+            lastSessionInitError = label + " response did not include iv. status=" + response.getStatus() + ", body=" + response.getBody();
             return false;
         }
-        if(!setKeyVars(response)) {
-            lastSessionInitError = "Session init key transfer failed.";
+        try {
+            if(!setKeyVars(response)) {
+                lastSessionInitError = label + " key transfer failed.";
+                return false;
+            }
+        } catch (RuntimeException ex) {
+            lastSessionInitError = label + " key transfer failed: " + rootMessage(ex);
+            new APIException(lastSessionInitError, ex).tryReport();
             return false;
         }
         if(!response.verifyLate(apiKey, secret, sessionRandom, clientPrivate, serverPublic)) {
-            lastSessionInitError = "Session init response authorization failed.";
+            lastSessionInitError = label + " response authorization failed.";
             return false;
         }
         this.activeSecret = response.nextSecretKey();
@@ -564,9 +824,7 @@ public class EncryptedClient implements AutoCloseable {
         this.nextRandom = response.nextRandom();
         this.nextAuthorization = response.nextAuthorization();
         this.nextSessionAuthorization = response.nextSessionAuthorization(sessionId);
-
         return true;
-
     }
 
     @Override
@@ -686,6 +944,14 @@ public class EncryptedClient implements AutoCloseable {
         this.sessionSecret = SHA.get256(rawSecret);
     }
 
+    private void clearResumeToken() {
+        try {
+            resumeTokenStore.clear();
+        } catch (RuntimeException ex) {
+            new APIException("Unable to clear the encrypted session resume token.", ex).tryReport();
+        }
+    }
+
     private String currentRawSessionSecret() {
         try {
             return cacheRawSessionSecret(readSecret(this.sessionSecretStore, "session secret"));
@@ -706,6 +972,16 @@ public class EncryptedClient implements AutoCloseable {
         String value = store.read();
         if(value == null || value.isBlank()) throw ExceptionHandling.invalid(label + " is required.");
         return value.trim();
+    }
+
+    private static String readOptionalSecret(ReadOnlySecretStore store) {
+        if (store == null) return "";
+        try {
+            String value = store.read();
+            return value == null ? "" : value.trim();
+        } catch (RuntimeException ignored) {
+            return "";
+        }
     }
 
     private static String stripTrailingSlash(String input) {

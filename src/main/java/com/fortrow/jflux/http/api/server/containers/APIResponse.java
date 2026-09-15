@@ -33,6 +33,7 @@ import org.json.simple.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.Collection;
 
 public class APIResponse {
 
@@ -253,12 +254,56 @@ public class APIResponse {
 
     }
 
+    /** Returns the generic limit response used before session authentication completes. */
+    public static APIResponse sessionLimitReached(ClientSession clientSession, int limit) {
+        JSONObject obj = new JSONObject();
+        obj.put("request_status", "session_limit_reached");
+        obj.put("error_code", "JFLUX_SESSION_LIMIT_REACHED");
+        obj.put("message", "The session allocation for this API key is full. Resume an existing session or call session/reset, then allocate again if more sessions are needed.");
+        obj.put("session_limit", limit);
+        return new APIResponse(clientSession, obj, ResponseCode.SESSION_LIMIT_REACHED, false);
+    }
+
+    /**
+     * Returns the authenticated diagnostic form of the session-limit response.
+     * The caller must only use this after API/session authorization succeeds.
+     */
+    @SuppressWarnings("unchecked")
+    public static APIResponse sessionLimitReached(ClientSession clientSession, int limit, int active,
+                                                  int resumeTokens, Collection<String> sessionIpAddresses) {
+        JSONObject obj = new JSONObject();
+        obj.put("request_status", "session_limit_reached");
+        obj.put("error_code", "JFLUX_SESSION_LIMIT_REACHED");
+        obj.put("message", "The session allocation for this API key is full. Resume an existing session or call session/reset, then allocate again if more sessions are needed.");
+        obj.put("session_limit", limit);
+        obj.put("active_sessions", Math.max(0, active));
+        obj.put("outstanding_resume_tokens", Math.max(0, resumeTokens));
+        org.json.simple.JSONArray addresses = new org.json.simple.JSONArray();
+        if(sessionIpAddresses != null) {
+            for(String address : sessionIpAddresses) {
+                if(address != null && !address.isBlank() && !addresses.contains(address)) addresses.add(address);
+            }
+        }
+        obj.put("session_ip_addresses", addresses);
+        return new APIResponse(clientSession, obj, ResponseCode.SESSION_LIMIT_REACHED, false);
+    }
+
+    /**
+     * @deprecated Use the generic overload before authentication or the
+     * authenticated overload with session IP addresses after authorization.
+     */
+    @Deprecated
+    public static APIResponse sessionLimitReached(ClientSession clientSession, int limit, int active, int resumeTokens) {
+        return sessionLimitReached(clientSession, limit);
+    }
+
     private static String statusFor(ResponseCode responseCode) {
         if(responseCode == null) return "server_error";
         return switch (responseCode) {
             case REQUEST_FAILED -> "fail";
             case FORBIDDEN -> "forbidden";
             case TOO_MANY_REQUESTS -> "too_many_requests";
+            case SESSION_LIMIT_REACHED -> "session_limit_reached";
             case UNAUTHORIZED -> "unauthorized";
             case SERVER_ERROR -> "server_error";
             case REQUEST_TIMEOUT -> "timeout";

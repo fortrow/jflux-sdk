@@ -89,6 +89,21 @@ class EncryptedPeerProtocolTest {
     }
 
     @Test
+    void sessionResetProofBindsApiKeyTimestampAndNonce() {
+        String apiSecret = "secret_" + Hex.getHex(Rand.secure(32));
+        String apiKey = "apikey_" + Hex.getHex(Rand.secure(32));
+        String timestamp = "1778455000";
+        String randomBytes = Hex.getHex(Rand.secure(44));
+        String proof = APIKeys.sessionResetAuthorization(apiSecret, apiKey, timestamp, randomBytes);
+
+        assertTrue(APIKeys.verifySessionResetAuthorization(proof, apiSecret, apiKey, timestamp, randomBytes));
+        assertFalse(APIKeys.verifySessionResetAuthorization(proof, apiSecret, apiKey, "1778455001", randomBytes));
+        assertFalse(APIKeys.verifySessionResetAuthorization(proof, apiSecret, apiKey, timestamp,
+                Hex.getHex(Rand.secure(44))));
+        assertFalse(APIKeys.verifySessionResetAuthorization(proof, apiSecret + "x", apiKey, timestamp, randomBytes));
+    }
+
+    @Test
     void gcmPayloadAuthenticationFailsWhenAadOrCiphertextChanges() {
         byte[] key = Rand.generateKey(256);
         byte[] nonce = Rand.generateIv(96);

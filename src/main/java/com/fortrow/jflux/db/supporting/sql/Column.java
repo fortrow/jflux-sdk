@@ -39,6 +39,14 @@ public class Column extends ColumnOrFunction {
         return "`" + this.name + "`";
     }
 
+    public String rawName() {
+        return this.name;
+    }
+
+    public String rawTable() {
+        return this.table;
+    }
+
     public Class getType() {
         return Column.class;
     }

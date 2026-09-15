@@ -45,8 +45,8 @@ public class ClientSession {
 
     public static ClientSession createClient(ClientInfo clientInfo, APIKeys apiKeys, APIServer server, boolean isZeroTrust) throws APIException {
         APIServerType serverType = server.getConfig().getServerType();
-        APISession session = new APISession(apiKeys, clientInfo.getRemoteIp(), serverType,
-                server.getConfig().getMinutesTillInvalid(), isZeroTrust
+        APISession session = new APISession(apiKeys.copyForSession(), clientInfo.getRemoteIp(), serverType,
+                server.getConfig().getMinutesTillInvalid(), server.getConfig().isSessionExpirationEnabled(), isZeroTrust
         );
         ClientSession retVal = new ClientSession(clientInfo, session);
 

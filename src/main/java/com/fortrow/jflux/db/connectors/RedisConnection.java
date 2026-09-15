@@ -35,6 +35,7 @@ public class RedisConnection extends DbConnection {
 
     public RedisConnection(DbConnectionDetails details) {
         super(details);
+        connectOnConstruction();
     }
 
     @Override
@@ -54,7 +55,10 @@ public class RedisConnection extends DbConnection {
 
     @Override
     public void close() throws Exception {
-        if(__.isset(conn)) conn.close();
+        if(__.isset(conn)) {
+            conn.close();
+            conn = null;
+        }
     }
 
     @Override
@@ -68,15 +72,10 @@ public class RedisConnection extends DbConnection {
 
     @Override
     public QueryResults execute(QueryRequest req) {
-
-        if(conn == null) {
-            try {
-                connect();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (CriticalException e) {
-                e.printStackTrace();
-            }
+        try { ensureConnected(); }
+        catch (Exception | CriticalException e) {
+            onError(e instanceof CriticalException ? (CriticalException) e : new CriticalException("Failed to connect to redis.", e));
+            return null;
         }
 
         RedisQueryParams p = (RedisQueryParams) req;
@@ -96,15 +95,10 @@ public class RedisConnection extends DbConnection {
 
     @Override
     public void executeUpdate(QueryRequest req) {
-
-        if(conn == null) {
-            try {
-                connect();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (CriticalException e) {
-                e.printStackTrace();
-            }
+        try { ensureConnected(); }
+        catch (Exception | CriticalException e) {
+            onError(e instanceof CriticalException ? (CriticalException) e : new CriticalException("Failed to connect to redis.", e));
+            return;
         }
 
         RedisQueryParams p = (RedisQueryParams) req;

@@ -37,4 +37,9 @@ public class StringSecretStore implements SecretStore {
     public void write(String value) {
         this.value = value;
     }
+
+    @Override
+    public void clear() {
+        this.value = "";
+    }
 }

@@ -69,6 +69,9 @@ public class CryptographyRegister {
         register.register("hmac-sha3-512", DefaultAlgorithms.hmac512());
         register.register("hmac-sha3-384", DefaultAlgorithms.hmac384());
         register.register("hmac-sha3-256", DefaultAlgorithms.hmac256());
+        register.register("hmac-sha1", DefaultAlgorithms.hmacSha1());
+        register.register("ed25519", DefaultAlgorithms.ed25519());
+        register.register("rsa-2048", DefaultAlgorithms.rsa(2048));
         register.register("rsa-4096", DefaultAlgorithms.rsa());
         if (PqcAvailability.available("org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters")) {
             register.register("ml-kem-512", DefaultAlgorithms.mlKem512());

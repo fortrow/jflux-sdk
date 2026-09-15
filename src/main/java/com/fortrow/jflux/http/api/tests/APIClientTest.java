@@ -47,9 +47,11 @@ public class APIClientTest {
         boolean http1 = hasArg(args, "--http1");
         boolean timing = hasArg(args, "--timing");
         boolean closeSession = hasArg(args, "--close-session");
+        boolean heartbeat = hasArg(args, "--heartbeat");
+        boolean closeResume = hasArg(args, "--close-resume");
 
         if(rest) testRest(http1, async, timing);
-        else testEncrypted(http1, async, timing, closeSession);
+        else testEncrypted(http1, async, timing, closeSession || closeResume, heartbeat, closeResume);
     }
 
     private static void testRest(boolean http1, boolean async, boolean timing) throws APIException {
@@ -73,7 +75,8 @@ public class APIClientTest {
         }
     }
 
-    private static void testEncrypted(boolean http1, boolean async, boolean timing, boolean closeSession) throws APIException, IOException {
+    private static void testEncrypted(boolean http1, boolean async, boolean timing,
+                                      boolean closeSession, boolean heartbeat, boolean closeResume) throws APIException, IOException {
         HttpVersion version = http1 ? HttpVersion.HTTP_1 : HttpVersion.HTTP_3;
         Path stateDir = Path.of(System.getProperty("user.home"), ".jflux-api-test");
         File pskFile = writeFile(stateDir.resolve("test.psk"), API_PSK);
@@ -107,8 +110,14 @@ public class APIClientTest {
             System.out.println("status=" + response.getStatus());
             System.out.println("body=" + response.getBody());
 
+            if(heartbeat) {
+                EncryptedResponse heartbeatResponse = client.heartbeat();
+                System.out.println("heartbeat_status=" + heartbeatResponse.getStatus());
+                System.out.println("heartbeat_body=" + heartbeatResponse.getBody());
+            }
+
             if(closeSession) {
-                EncryptedResponse closeResponse = client.closeSessionOrThrow();
+                EncryptedResponse closeResponse = client.closeSessionOrThrow(closeResume);
                 System.out.println("close_status=" + closeResponse.getStatus());
                 System.out.println("close_body=" + closeResponse.getBody());
             }

@@ -21,47 +21,42 @@
  */
 package com.fortrow.jflux.runtime.lib;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.jar.JarEntry;
+import java.util.Arrays;
 
-public class StreamClassLoader extends ClassLoader {
+/**
+ * @deprecated Use {@code com.fortrow.jflux.runtime.RuntimeClassLoader}.
+ */
+@Deprecated(since = "1.1.0", forRemoval = false)
+public class StreamClassLoader extends ClassLoader implements AutoCloseable {
 
-    private final Map<String, byte[]> classData;
+    private final Map<String, byte[]> classData = new LinkedHashMap<>();
+    private boolean closed;
 
     public StreamClassLoader(JarFileObjectInputStream is) throws IOException {
-        classData = new HashMap();
-        JarEntry jarEntry = null;
-
-        while ((jarEntry = is.getNextJarEntry()) != null) {
+        if(is == null) throw new IOException("JAR stream is required");
+        JarEntry jarEntry;
+        while((jarEntry = is.getNextJarEntry()) != null) {
+            if(jarEntry.isDirectory()) continue;
             String entryName = jarEntry.getName();
-            ByteArrayOutputStream ba = new ByteArrayOutputStream();
-            byte[] bite = new byte[1];
-
-            while(is.read(bite, 0, 1) > 0) {
-                ba.write(bite[0]);
-                bite = new byte[1];
-            }
-
-            byte[] entryData = ba.toByteArray();
-
             if (entryName.endsWith(".class")) {
-                String className = entryName.replace("/", ".").replace(".class", "");
-                classData.put(className, entryData);
+                String className = entryName.substring(0, entryName.length() - 6).replace('/', '.');
+                classData.put(className, is.readAllBytes());
             }
         }
     }
 
     public String[] getAllClassNames() {
-        Set<String> keyset = classData.keySet();
-        return keyset.toArray(new String[keyset.size()]);
+        return classData.keySet().toArray(String[]::new);
     }
 
     @Override
-    public Class loadClass(String name) throws ClassNotFoundException {
+    public Class<?> loadClass(String name) throws ClassNotFoundException {
         // note that it is required to first try loading the class using parent loader
         try {
             return super.loadClass(name);
@@ -72,15 +67,17 @@ public class StreamClassLoader extends ClassLoader {
 
     @Override
     public Class findClass(String name) throws ClassNotFoundException {
-        Class loadedClass = null;
+        if(closed) throw new ClassNotFoundException(name + " (loader closed)");
+        byte[] data = classData.get(name);
+        if(data == null) throw new ClassNotFoundException(name);
+        return defineClass(name, data, 0, data.length);
+    }
 
-        byte[] data = classData.getOrDefault(name, new byte[0]);
-        if (data.length == 0) {
-            throw new ClassNotFoundException();
-        }
-
-        loadedClass = defineClass(name, data, 0, data.length, null);
-
-        return loadedClass;
+    @Override
+    public void close() {
+        if(closed) return;
+        closed = true;
+        classData.values().stream().distinct().forEach(bytes -> Arrays.fill(bytes, (byte) 0));
+        classData.clear();
     }
 }

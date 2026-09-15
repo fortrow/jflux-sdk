@@ -53,6 +53,8 @@ public abstract class APIKeys {
     private String key;
     private String secret;
     private String sessionSecret;
+    /** Private shared secret used only by the external authentication backend and JFlux. */
+    private String sessionAllocationSecret;
     private String psk;
 
     private String clientPayloadKey;
@@ -82,32 +84,45 @@ public abstract class APIKeys {
         private String key;
         private String secret;
         private String sessionSecret;
+        private String sessionAllocationSecret;
         private String psk;
 
         public Keys(String key, String secret, String sessionSecret, String psk) {
+            this(key, secret, sessionSecret, psk, secureHex(32));
+        }
+
+        public Keys(String key, String secret, String sessionSecret, String psk, String sessionAllocationSecret) {
             this.key = key;
             this.secret = secret;
             this.sessionSecret = sessionSecret;
             this.psk = psk;
+            this.sessionAllocationSecret = sessionAllocationSecret;
         }
 
         public String getKey() { return key; }
         public String getSecret() { return secret; }
         public String getSessionSecret() { return sessionSecret; }
+        public String getSessionAllocationSecret() { return sessionAllocationSecret; }
         public String getPsk() { return psk; }
     }
 
     public APIKeys(String key, String secret, String sessionSecret, String psk) {
+        this(key, secret, sessionSecret, psk, secureHex(32));
+    }
+
+    public APIKeys(String key, String secret, String sessionSecret, String psk, String sessionAllocationSecret) {
         this.key = key;
         this.secret = secret;
         this.sessionSecret = sessionSecret;
         this.psk = psk;
+        this.sessionAllocationSecret = sessionAllocationSecret;
     }
 
     public APIKeys(Keys keys) {
         this.key = keys.getKey();
         this.secret = keys.getSecret();
         this.sessionSecret = keys.getSessionSecret();
+        this.sessionAllocationSecret = keys.getSessionAllocationSecret();
         this.psk = keys.getPsk();
     }
 
@@ -115,14 +130,21 @@ public abstract class APIKeys {
         this.key = keys.getKey();
         this.secret = keys.getSecret();
         this.sessionSecret = keys.getSessionSecret();
+        this.sessionAllocationSecret = keys.getSessionAllocationSecret();
         this.psk = keys.getPsk();
         this.allowedIps = allowedIps;
     }
 
     public APIKeys(String key, String secret, String sessionSecret, String psk, List<IpAddress> allowedIps) {
+        this(key, secret, sessionSecret, psk, secureHex(32), allowedIps);
+    }
+
+    public APIKeys(String key, String secret, String sessionSecret, String psk,
+                   String sessionAllocationSecret, List<IpAddress> allowedIps) {
         this.key = key;
         this.secret = secret;
         this.sessionSecret = sessionSecret;
+        this.sessionAllocationSecret = sessionAllocationSecret;
         this.psk = psk;
         this.allowedIps = allowedIps;
     }
@@ -198,6 +220,10 @@ public abstract class APIKeys {
 
     public String getSessionSecret() { return SHA.get256(this.sessionSecret); }
     public String getRawSessionSecret() { return this.sessionSecret; }
+    /** Returns the private allocation-signing secret for server-side provisioning only. */
+    public String getRawSessionAllocationSecret() { return this.sessionAllocationSecret; }
+    /** Returns the private allocation-signing secret; it must never be sent to clients. */
+    public String getSessionAllocationSecret() { return this.sessionAllocationSecret; }
     public String getKey() { return key; }
     public String getSecret() { return secret; }
     public String getPsk() { return psk; }
@@ -209,6 +235,34 @@ public abstract class APIKeys {
     public String getServerPayloadKey() { return serverPayloadKey; }
     public String getServerIv() { return serverIv; }
     public String getServerEncrypted() { return serverEncrypted; }
+
+    /**
+     * Creates an isolated key container for one encrypted session while
+     * retaining the persistent API-key update callback.
+     */
+    public APIKeys copyForSession() {
+        APIKeys source = this;
+        return new APIKeys(key, secret, sessionSecret, psk, sessionAllocationSecret, allowedIps) {
+            @Override
+            public void updateSessionSecret(APIKeys keys, String nextSessionSecret) throws APIException {
+                source.updateSessionSecret(keys, nextSessionSecret);
+            }
+        };
+    }
+
+    /** Invalidates ephemeral session material without destroying the root API credential. */
+    public synchronized void invalidateSessionMaterial() {
+        sessionSecret = "";
+        psk = "";
+        clientPayloadKey = "";
+        clientIv = "";
+        clientEncrypted = "";
+        serverPayloadKey = "";
+        serverIv = "";
+        serverEncrypted = "";
+        if(randomBytes != null) Arrays.fill(randomBytes, (byte) 0);
+        randomBytes = null;
+    }
 
     public boolean ipIsAllowed(IpAddress ip) {
         if(!__.isset(allowedIps)) return true;
@@ -330,6 +384,28 @@ public abstract class APIKeys {
         return SecureCompare.equals(expected, received);
     }
 
+    /**
+     * Creates a short-lived authorization proof for resetting the session
+     * allocation. Unlike the rotating session root, this proof is derived
+     * from the long-lived API secret and is bound to the request timestamp and
+     * nonce so a stale ratchet checkpoint can still be recovered without
+     * adding a reusable bearer token.
+     */
+    public static String sessionResetAuthorization(String apiSecret, String apiKey,
+                                                   String timestamp, String randomBytes) {
+        return SHA.getHmac384(sessionResetIntent(apiKey, timestamp, randomBytes), apiSecret);
+    }
+
+    public static boolean verifySessionResetAuthorization(String received, String apiSecret,
+                                                          String apiKey, String timestamp,
+                                                          String randomBytes) {
+        if (received == null || received.isBlank() || apiSecret == null || apiSecret.isBlank()
+                || apiKey == null || apiKey.isBlank() || timestamp == null || timestamp.isBlank()
+                || randomBytes == null || randomBytes.isBlank()) return false;
+        String expected = sessionResetAuthorization(apiSecret, apiKey, timestamp, randomBytes);
+        return SecureCompare.equals(expected, received);
+    }
+
     public static byte[] deriveRequestMacKey(String apiSecret, String requestSecret, String apiKey, String sessionId) {
         byte[] inputKeyMaterial = secretMaterial(requestSecret);
         byte[] salt = Hex.fromHex(SHA.get256(nullToEmpty(apiSecret) + ":" + nullToEmpty(apiKey) + ":" + nullToEmpty(sessionId)));
@@ -349,6 +425,14 @@ public abstract class APIKeys {
                 + "\nsession-id:" + nullToEmpty(sessionId)
                 + "\nkey-set-id:" + nullToEmpty(keySetId)
                 + "\nsequence:" + nullToEmpty(sequence);
+    }
+
+    private static String sessionResetIntent(String apiKey, String timestamp, String randomBytes) {
+        return "JFLUX-HTTP-API/1"
+                + "\naction:session-reset"
+                + "\napi-key:" + nullToEmpty(apiKey)
+                + "\ntimestamp:" + nullToEmpty(timestamp)
+                + "\nrandom-bytes:" + nullToEmpty(randomBytes);
     }
 
     private static String requestAadString(String method, String path, String timestamp, String sequence, String apiKey, String sessionId, String keySetId, String nonce, String contentType, String resourceMethod) {

@@ -76,11 +76,13 @@ class ApiServiceKeyTest {
             );
             service.configureDatabases(config);
 
+            String allocationSecret = "allocation_test_secret";
             service.registerApiKeys(
                     "apikey_test",
                     "secret_test",
                     "session_test",
                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    allocationSecret,
                     List.of(new IpAddress("127.0.0.1"))
             );
 
@@ -89,6 +91,8 @@ class ApiServiceKeyTest {
             assertEquals("apikey_test", lookup.getKey());
             assertEquals("secret_test", lookup.getSecret());
             assertEquals("session_test", lookup.getRawSessionSecret());
+            assertNotNull(lookup.getRawSessionAllocationSecret());
+            assertEquals(allocationSecret, lookup.getRawSessionAllocationSecret());
             assertEquals("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", lookup.getPsk());
             assertFalse(lookup.ipIsAllowed("10.0.0.1"));
 
@@ -106,6 +110,7 @@ class ApiServiceKeyTest {
             assertFalse(persistedPayload.contains("apikey_test"));
             assertFalse(persistedPayload.contains("secret_test"));
             assertFalse(persistedPayload.contains("session_test"));
+            assertFalse(persistedPayload.contains(allocationSecret));
             assertFalse(persistedPayload.contains("0123456789abcdef"));
             assertFalse(persistedCiphertext.contains("secret_test"));
         } finally {
@@ -140,6 +145,40 @@ class ApiServiceKeyTest {
                 apiRows.next();
                 assertEquals(0, apiRows.getInt(1));
             }
+
+            service.replaceApiKeys("apikey_lock", "secret_lock", "session_lock", "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd", null);
+            assertNotNull(service.lookupApiKeys("apikey_lock"));
+        } finally {
+            java.nio.file.Files.deleteIfExists(db);
+        }
+    }
+
+    @Test
+    void sharedBootstrapKeyDoesNotPersistRotatedSessionRoot() throws Throwable {
+        Path db = java.nio.file.Files.createTempFile("jflux-api-service-bootstrap", ".db");
+        try {
+            APIServerConfig config = new APIServerConfig(0);
+            config.setSessionDb(DatabaseServerType.SQLITE, new DbConnectionSqlLiteDetails(db.toString()));
+
+            ApiService service = new ApiService(
+                    "Bootstrap",
+                    ApiService.generateAppKey("Bootstrap", "bootstrap-test-nonce")
+            );
+            service.configureDatabases(config);
+            service.registerApiKeys(
+                    "apikey_bootstrap",
+                    "secret_bootstrap",
+                    "session_bootstrap",
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            );
+            service.setSessionSecretPersistence("apikey_bootstrap", false);
+
+            APIKeys lookup = service.lookupApiKeys("apikey_bootstrap");
+            assertNotNull(lookup);
+            lookup.updateSessionSecret(lookup, "rotated-server-root");
+
+            assertEquals("session_bootstrap",
+                    service.lookupApiKeys("apikey_bootstrap").getRawSessionSecret());
         } finally {
             java.nio.file.Files.deleteIfExists(db);
         }

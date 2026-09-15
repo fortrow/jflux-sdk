@@ -21,41 +21,43 @@
  */
 package com.fortrow.jflux.runtime.lib;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
+/**
+ * @deprecated Use {@code Files.newInputStream} or the JFlux runtime package loader.
+ */
+@Deprecated(since = "1.1.0", forRemoval = false)
 public class JarFileInputStream extends InputStream {
 
-    private ByteArrayInputStream bis;
-    private byte[] data;
+    private final InputStream input;
 
-    public JarFileInputStream(String path) throws Exception {
-
-        bis = new ByteArrayInputStream(new byte[]{});
-        FileInputStream in = new FileInputStream(path);
-        BufferedInputStream bin = new BufferedInputStream(in);
-        ByteArrayOutputStream ba = new ByteArrayOutputStream();
-
-        byte[] bite = new byte[1];
-        while(bin.read(bite, 0, 1) > 0) {
-            ba.write(bite[0]);
-            bite = new byte[1];
-        }
-        bis = new ByteArrayInputStream(ba.toByteArray());
+    public JarFileInputStream(String path) throws IOException {
+        if(path == null || path.isBlank()) throw new IOException("JAR path is required");
+        input = new BufferedInputStream(Files.newInputStream(Path.of(path)));
     }
 
     @Override
     public int read() throws IOException {
-        return this.bis.read();
+        return input.read();
     }
 
     @Override
     public int read(byte[] toStore) throws IOException {
-        return this.bis.read(toStore);
+        return input.read(toStore);
     }
 
     @Override
     public int read(byte[] toStore, int off, int len) throws IOException {
-        return this.bis.read(toStore, off, len);
+        return input.read(toStore, off, len);
+    }
+
+    @Override
+    public void close() throws IOException {
+        input.close();
     }
 
 }

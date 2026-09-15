@@ -21,16 +21,16 @@
  */
 package com.fortrow.jflux.stdout;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
+import com.fortrow.jflux.shell.CommandResult;
+import com.fortrow.jflux.shell.Shell;
+import com.fortrow.jflux.sys.PlatformUtils;
+
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 public class TableGenerator {
 
@@ -38,6 +38,7 @@ public class TableGenerator {
     private static final int MIN_TERMINAL_WIDTH = 40;
     private static final int MIN_COLUMN_WIDTH = 4;
     private static final int PADDING_SIZE = 1;
+    private static volatile int detectedTerminalWidth;
 
     private final String newLine = "\n";
     private final String tableJointSymbol = "+";
@@ -245,56 +246,41 @@ public class TableGenerator {
         int configured = parsePositiveInt(System.getenv("JFLUX_TABLE_WIDTH"));
         if(configured > 0) return Math.max(MIN_TERMINAL_WIDTH, configured);
 
+        int cached = detectedTerminalWidth;
+        if(cached > 0) return cached;
+
         int ttyColumns = ttyColumns();
-        if(ttyColumns > 0) return Math.max(MIN_TERMINAL_WIDTH, ttyColumns);
+        if(ttyColumns > 0) return cacheWidth(ttyColumns);
 
         int columns = parsePositiveInt(System.getenv("COLUMNS"));
-        if(columns > 0) return Math.max(MIN_TERMINAL_WIDTH, columns);
+        if(columns > 0) return cacheWidth(columns);
 
         int tputColumns = tputColumns();
-        if(tputColumns > 0) return Math.max(MIN_TERMINAL_WIDTH, tputColumns);
+        if(tputColumns > 0) return cacheWidth(tputColumns);
 
-        return DEFAULT_TERMINAL_WIDTH;
+        return cacheWidth(DEFAULT_TERMINAL_WIDTH);
     }
 
     private int ttyColumns() {
-        Process process = null;
-        try {
-            process = new ProcessBuilder("sh", "-c", "stty size < /dev/tty 2>/dev/null | awk '{print $2}'")
-                    .redirectErrorStream(true)
-                    .start();
-            if(!process.waitFor(Duration.ofMillis(250).toMillis(), TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
-                return -1;
-            }
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                return parsePositiveInt(reader.readLine());
-            }
-        } catch (Exception ignored) {
-            return -1;
-        } finally {
-            if(process != null && process.isAlive()) process.destroyForcibly();
-        }
+        if (PlatformUtils.isWindows()) return -1;
+        CommandResult result = Shell.execute(
+                List.of("sh", "-c", "stty size < /dev/tty 2>/dev/null | awk '{print $2}'"),
+                Duration.ofMillis(250), 1024);
+        return result.success() ? parsePositiveInt(result.stdout().strip()) : -1;
     }
 
     private int tputColumns() {
-        Process process = null;
-        try {
-            process = new ProcessBuilder("sh", "-c", "tput cols 2>/dev/null")
-                    .redirectErrorStream(true)
-                    .start();
-            if(!process.waitFor(Duration.ofMillis(250).toMillis(), TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
-                return -1;
-            }
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                return parsePositiveInt(reader.readLine());
-            }
-        } catch (Exception ignored) {
-            return -1;
-        } finally {
-            if(process != null && process.isAlive()) process.destroyForcibly();
-        }
+        if (PlatformUtils.isWindows()) return -1;
+        CommandResult result = Shell.execute(
+                List.of("sh", "-c", "tput cols 2>/dev/null"),
+                Duration.ofMillis(250), 1024);
+        return result.success() ? parsePositiveInt(result.stdout().strip()) : -1;
+    }
+
+    private int cacheWidth(int width) {
+        int normalized = Math.max(MIN_TERMINAL_WIDTH, width);
+        detectedTerminalWidth = normalized;
+        return normalized;
     }
 
     private int parsePositiveInt(String value) {

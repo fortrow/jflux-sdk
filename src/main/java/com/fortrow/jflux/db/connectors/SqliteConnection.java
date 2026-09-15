@@ -43,13 +43,7 @@ public class SqliteConnection extends DbConnection {
 
     public SqliteConnection(DbConnectionSqlLiteDetails details) {
         super(details);
-        if(conn == null) {
-            try {
-                connect();
-            } catch (Exception | CriticalException e) {
-                onError(e instanceof CriticalException ? (CriticalException) e : new CriticalException("Failed to connect to sqlite.", e));
-            }
-        }
+        connectOnConstruction();
     }
 
     @Override
@@ -73,7 +67,10 @@ public class SqliteConnection extends DbConnection {
 
     @Override
     public void close() throws Exception {
-        if(conn != null) conn.close();
+        if(conn != null) {
+            conn.close();
+            conn = null;
+        }
     }
 
     @Override
@@ -83,14 +80,10 @@ public class SqliteConnection extends DbConnection {
     @Override
     public QueryResults execute(QueryRequest req) {
 
-        if(conn == null) {
-            try {
-                connect();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (CriticalException e) {
-                e.printStackTrace();
-            }
+        try { ensureConnected(); }
+        catch (Exception | CriticalException e) {
+            onError(e instanceof CriticalException ? (CriticalException) e : new CriticalException("Failed to connect to sqlite.", e));
+            return null;
         }
 
         QueryParams p = (QueryParams) req;
@@ -98,19 +91,13 @@ public class SqliteConnection extends DbConnection {
         try {
             SQLBuilder builder = new SQLBuilder(p);
             String preparedSql = builder.getPreparedString(true);
-            PreparedStatement stmt = conn.prepareStatement(preparedSql);
-            for(int i=0;i< builder.valueSize(); i++) {
-                Object v = builder.next();
-                if(v == null) continue;
-                else if(v.getClass() == Field.class) v = ((Field) v).get();
-                else if(v.getClass() == Condition.class) v = ((Condition) v).value();
-                SQLBuilder.set(stmt, i + 1, v);
+            try(PreparedStatement stmt = conn.prepareStatement(preparedSql)) {
+                builder.bind(stmt);
+                try(ResultSet resultSet = stmt.executeQuery()) {
+                    return new QueryResults(resultSet, p.selectColumns(), p.tableName());
+                }
             }
-            ResultSet resultSet = stmt.executeQuery();
-            return new QueryResults(resultSet, p.selectColumns(), p.tableName());
         } catch (Exception e) {
-            System.out.println(e.getMessage());
-            e.printStackTrace();
             onError(new CriticalException("Failed to execute query.", e));
         }
 
@@ -120,14 +107,10 @@ public class SqliteConnection extends DbConnection {
     @Override
     public void executeUpdate(QueryRequest req) {
 
-        if(conn == null) {
-            try {
-                connect();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (CriticalException e) {
-                e.printStackTrace();
-            }
+        try { ensureConnected(); }
+        catch (Exception | CriticalException e) {
+            onError(e instanceof CriticalException ? (CriticalException) e : new CriticalException("Failed to connect to sqlite.", e));
+            return;
         }
 
         QueryParams p = (QueryParams) req;
@@ -135,17 +118,11 @@ public class SqliteConnection extends DbConnection {
         try {
             SQLBuilder builder = new SQLBuilder(p);
             String preparedSql = builder.getPreparedString(true);
-            PreparedStatement stmt = conn.prepareStatement(preparedSql);
-            for(int i=0;i< builder.valueSize(); i++) {
-                Object v = builder.next();
-                if(v == null) continue;
-                else if(v.getClass() == Field.class) v = ((Field) v).get();
-                else if(v.getClass() == Condition.class) v = ((Condition) v).value();
-                SQLBuilder.set(stmt, i + 1, v);
+            try(PreparedStatement stmt = conn.prepareStatement(preparedSql)) {
+                builder.bind(stmt);
+                stmt.executeUpdate();
             }
-            stmt.executeUpdate();
         } catch (Exception e) {
-            e.printStackTrace();
             onError(new CriticalException("Failed to execute query.", e));
         }
 

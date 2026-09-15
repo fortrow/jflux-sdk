@@ -61,7 +61,11 @@ after real values are supplied.
 Gmail uses `smtp.gmail.com:587` with STARTTLS and Outlook uses
 `smtp.office365.com:587` with STARTTLS. Gmail generally requires an app password
 when account security policies disallow basic account passwords. The generic email
-configuration record supports custom SMTP servers and implicit SSL.
+configuration record supports custom SMTP servers and implicit SSL. The reporter
+delegates delivery to `com.fortrow.jflux.email.SMTP` using its non-throwing
+`trySend` path, so an unavailable mail server cannot recursively report the
+exception it failed to deliver. See [`email.md`](email.md) for direct application
+email, MIME, attachment, and TLS behavior.
 
 ## SQL reporting
 

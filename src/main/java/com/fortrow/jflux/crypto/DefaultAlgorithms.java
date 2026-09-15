@@ -41,7 +41,13 @@ import com.fortrow.jflux.exceptions.ExceptionHandling;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.MessageDigest;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -154,7 +160,11 @@ public class DefaultAlgorithms {
     }
 
     public static AsymmetricAlgorithm rsa() {
-        return new AsymmetricAlgorithm("rsa-4096", 4096) {
+        return rsa(4096);
+    }
+
+    public static AsymmetricAlgorithm rsa(int bitSize) {
+        return new AsymmetricAlgorithm("rsa-" + bitSize, bitSize) {
             @Override
             public byte[] encrypt(byte[] input, byte[] key, byte[]... aad) {
                 return BaseX.bytesFrom64(RSA.encrypt(input, RSA.publicKeyFromBytes(key)));
@@ -167,7 +177,7 @@ public class DefaultAlgorithms {
 
             @Override
             public byte[][] generateKeyPair(byte[]... params) {
-                KeyPair kp = RSA.generateKeyPair(4096);
+                KeyPair kp = RSA.generateKeyPair(bitSize);
                 byte[] publicKey = kp.getPublic().getEncoded();
                 byte[] privateKey = kp.getPrivate().getEncoded();
                 return new byte[][]{publicKey, privateKey};
@@ -236,6 +246,53 @@ public class DefaultAlgorithms {
                 return hmac("HmacSHA256", input, key);
             }
         };
+    }
+
+    public static HmacAlgorithm hmacSha1() {
+        return new HmacAlgorithm("hmac-sha1", 20, 20) {
+            @Override
+            public byte[] hash(byte[] input, byte[] key) {
+                return hmac("HmacSHA1", input, key);
+            }
+        };
+    }
+
+    public static SignatureAlgorithm ed25519() {
+        return new SignatureAlgorithm(
+                "ed25519",
+                () -> {
+                    try {
+                        KeyPair pair = java.security.KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+                        return new byte[][]{pair.getPublic().getEncoded(), pair.getPrivate().getEncoded()};
+                    } catch (Exception failure) {
+                        throw ExceptionHandling.failure("Unable to generate Ed25519 key pair", failure);
+                    }
+                },
+                (input, privateBytes) -> {
+                    try {
+                        PrivateKey privateKey = KeyFactory.getInstance("Ed25519")
+                                .generatePrivate(new PKCS8EncodedKeySpec(privateBytes));
+                        Signature signature = Signature.getInstance("Ed25519");
+                        signature.initSign(privateKey);
+                        signature.update(input);
+                        return signature.sign();
+                    } catch (Exception failure) {
+                        throw ExceptionHandling.failure("Unable to sign Ed25519 payload", failure);
+                    }
+                },
+                (input, signatureBytes, publicBytes) -> {
+                    try {
+                        PublicKey publicKey = KeyFactory.getInstance("Ed25519")
+                                .generatePublic(new X509EncodedKeySpec(publicBytes));
+                        Signature signature = Signature.getInstance("Ed25519");
+                        signature.initVerify(publicKey);
+                        signature.update(input);
+                        return signature.verify(signatureBytes);
+                    } catch (Exception failure) {
+                        ExceptionHandling.report(failure);
+                        return false;
+                    }
+                });
     }
 
     public static SymmetricAlgorithm chacha20Poly1305() {

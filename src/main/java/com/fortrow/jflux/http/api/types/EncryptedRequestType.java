@@ -24,6 +24,10 @@ package com.fortrow.jflux.http.api.types;
 public enum EncryptedRequestType {
 
     SESSION_INIT,
+    SESSION_RESUME,
+    SESSION_RESET,
+    SESSION_ALLOCATE,
+    SESSION_HEARTBEAT,
     EXECUTE_RESOURCE,
     SESSION_CLOSE,
 

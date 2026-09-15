@@ -24,21 +24,26 @@ package com.fortrow.jflux.db.supporting;
 import com.fortrow.jflux.db.connectors.details.DbConnectionDetails;
 import com.fortrow.jflux.exceptions.types.CriticalException;
 
-public abstract class DbConnection implements ExecutesQueries {
+public abstract class DbConnection implements ExecutesQueries, AutoCloseable {
 
     protected DbConnectionDetails details;
 
     public DbConnection(DbConnectionDetails details) {
         this.details = details;
+    }
+
+    protected final synchronized void connectOnConstruction() {
         try {
-            connect();
+            ensureConnected();
         } catch(Exception | CriticalException e) {
-            if(e instanceof CriticalException) {
-                onError((CriticalException) e);
-                return;
-            }
-            onError(new CriticalException("Failed to connect to database", e));
+            onError(e instanceof CriticalException
+                    ? (CriticalException) e
+                    : new CriticalException("Failed to connect to database", e));
         }
+    }
+
+    protected final synchronized void ensureConnected() throws Exception, CriticalException {
+        if(getConn() == null) connect();
     }
 
     public abstract Object getConn();

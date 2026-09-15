@@ -1,6 +1,6 @@
 # HTTP, REST, and encrypted APIs
 
-JFlux 1.1.0 treats HTTP failures, invalid request data, and encrypted protocol
+JFlux 1.1.1 treats HTTP failures, invalid request data, and encrypted protocol
 failures as reportable API events through `APIException`, which extends
 `ReportedException`. Applications can configure the normal exception reporting
 policy and use `tryReport()` when an API failure should be escalated explicitly.
@@ -54,3 +54,129 @@ Existing REST and encrypted public entry points remain available. Header and
 body containers now return safe null/empty values for absent optional fields,
 while strict request validation occurs at the server boundary. Existing
 application-level error response codes and JSON status fields are preserved.
+
+## Encrypted session capacity
+
+Encrypted session capacity is allocated per root API key. Every API key starts
+with one available session slot. The old global `setMaxSessions` setting is
+deprecated and is no longer used for enforcement.
+
+The configured encrypted lifecycle paths are, in order:
+
+1. `session/init` — creates the first session or an additional session when a
+   slot has been allocated.
+2. `session/close` — closes a live session. Set `create_resume_token` to
+   `true` in the encrypted JSON body to receive a one-time resume token.
+3. `session/resume` — consumes that close-generated token and creates a fresh
+   encrypted session. The original API key and root session authorization are
+   still required.
+4. `session/reset` — invalidates every live session, all resume tokens, and
+   pending allocation challenges for the API key, then returns its capacity
+   to one.
+5. `session/allocate` — issues a one-time challenge, then verifies a signed
+   allocation assertion from the application's external authentication
+   backend. Each accepted assertion increases the API key's capacity by one.
+6. `session/heartbeat` — refreshes the inactivity deadline for an existing
+   encrypted session. It is authenticated and ratcheted like a normal request,
+   but it does not allocate a session or create a resume token.
+
+When active sessions plus outstanding resume-token reservations reach the
+per-key capacity, new initialization returns HTTP 429 and a structured
+`JFLUX_SESSION_LIMIT_REACHED` error. Clients should resume a closed session or
+call `session/reset`; they should not repeatedly retry `session/init`.
+
+The limit response is deliberately two-tiered. Before the requested session's
+normal API/session authorization has succeeded, JFlux returns only the generic
+limit status, message, and configured capacity. After authorization succeeds
+and the request is blocked solely because capacity is full, the response also
+contains `active_sessions`, `outstanding_resume_tokens`, and the unique
+`session_ip_addresses` currently associated with the API key. This prevents an
+unauthenticated caller from using the limit endpoint to enumerate active
+sessions or client addresses.
+
+Resume-token metadata stores only token hashes, API-key hashes, session IDs,
+expiry times, and used flags. Configure a durable metadata file when tokens
+and allocated per-key capacities must survive a server restart:
+
+```java
+APIServerConfig config = new APIServerConfig(8443, "/api")
+        .setSessionResumeStorePath("/var/lib/my-app/jflux-resume-tokens.json")
+        .setResumeTokenMinutes(30);
+```
+
+Expiration based on the last request is enabled by default for 30 minutes and
+can be disabled with `setSessionExpirationEnabled(false)`.
+
+## Session allocation and external authentication
+
+JFlux is credential-blind. It does not receive or store usernames, passwords,
+MFA values, or identity-provider credentials. The separate web-authentication
+backend performs that authentication and signs an allocation assertion after
+the user has been authenticated.
+
+Every API key has a separate `session_allocation_secret`. It is generated with
+the API key, encrypted with the API service's existing key-record storage, and
+is never included in an HTTP request or response. The JFlux server and the
+external authentication backend must provision the same secret privately.
+Do not reuse the API secret, session secret, or PSK.
+
+When provisioning an API key, copy the secret to the private configuration of
+the external authentication backend through a secure administrative channel:
+
+```java
+APIKeys apiKeys = api.generateApiKeys();
+String allocationSecret = apiKeys.getRawSessionAllocationSecret();
+// Store allocationSecret in the web-authentication backend's private secret store.
+```
+
+The value should never be logged, returned by an application endpoint, or sent
+to an encrypted API client.
+
+The client flow is:
+
+```java
+JSONObject challenge = client.requestAllocationChallenge();
+// Send challenge_id and challenge to the web-authentication backend.
+// That backend performs username/password/MFA authentication privately.
+
+SessionAllocationAssertion assertion = SessionAllocationAssertion.sign(
+        apiKey,
+        (String) challenge.get("challenge_id"),
+        (String) challenge.get("challenge"),
+        Instant.now(),
+        Instant.ofEpochMilli((Long) challenge.get("expires_at_ms")),
+        allocationSecret);
+
+JSONObject allocation = client.allocateSession(assertion);
+```
+
+The external backend must use its private copy of the allocation secret. The
+assertion contains only the API-key identifier, challenge values, timestamps,
+and an HMAC-SHA384 signature. JFlux verifies the signature with its own copy,
+checks the challenge and expiration, consumes the challenge once, and adds
+exactly one session slot. Replaying or modifying an assertion fails.
+
+For non-Java authentication services, sign this canonical payload with
+HMAC-SHA384 and send the resulting lowercase hexadecimal signature:
+
+```text
+JFLUX-HTTP-API/1
+action:session-allocate
+api-key:<api-key>
+challenge-id:<challenge-id>
+challenge:<challenge>
+issued-at-ms:<issued-at-ms>
+expires-at-ms:<expires-at-ms>
+```
+
+The allocation request sends these fields to JFlux:
+`api_key`, `challenge_id`, `challenge`, `issued_at_ms`, `expires_at_ms`, and
+`signature`. There is no OAuth token and there is no configurable allocation
+amount. The deprecated client methods that accepted usernames, MFA values, or
+OAuth-style tokens now reject those flows.
+
+`EncryptedClient` can automatically use a saved resume token before trying a
+new initialization. Use `setResumeTokenFile(...)` or `setResumeTokenStore(...)`
+to enable this behavior. `closeSessionOrThrow(true)` requests and persists a
+resume token; `resetSessions()` clears the local token after a successful
+server reset.

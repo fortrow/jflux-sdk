@@ -50,16 +50,23 @@ public class APISession {
     private boolean isActive = true;
     private final List<LocalDateTime> recentRequests = Collections.synchronizedList(new ArrayList<>());
     private int minutesTillInvalid = 30;
+    private boolean expirationEnabled = true;
     private long lastRequestSequence = 0;
     private byte[] currentRequestAad;
 
     public record State(String sessionAuth, long lastRequestSequence, byte[] currentRequestAad) { }
 
     public APISession(APIKeys apiKeys, String ipAddr, APIServerType serverType, int minutesTillInvalid, boolean isZeroTrust) throws APIException {
+        this(apiKeys, ipAddr, serverType, minutesTillInvalid, true, isZeroTrust);
+    }
+
+    public APISession(APIKeys apiKeys, String ipAddr, APIServerType serverType, int minutesTillInvalid,
+                      boolean expirationEnabled, boolean isZeroTrust) throws APIException {
         this.apiKeys = apiKeys;
         this.started = LocalDateTime.now();
         this.lastRequest = LocalDateTime.now();
-        this.minutesTillInvalid = minutesTillInvalid;
+        this.minutesTillInvalid = Math.max(1, minutesTillInvalid);
+        this.expirationEnabled = expirationEnabled;
 
         if(isZeroTrust) {
             this.sessionId = createSessionId(ipAddr);
@@ -75,6 +82,7 @@ public class APISession {
     public String getSessionId() { return sessionId; }
 
     public boolean invalidateByTime() {
+        if(!expirationEnabled || !isActive) return false;
         LocalDateTime limit = lastRequest.plusMinutes(minutesTillInvalid);
         if(LocalDateTime.now().isAfter(limit)) {
             deactivate();
@@ -129,13 +137,28 @@ public class APISession {
     public void setCurrentRequestAad(byte[] currentRequestAad) { this.currentRequestAad = currentRequestAad; }
 
     public boolean isActive() { return isActive; }
-    public void deactivate() { isActive = false; }
+    public synchronized void deactivate() {
+        if(!isActive) return;
+        isActive = false;
+        if(apiKeys != null) apiKeys.invalidateSessionMaterial();
+        if(randomBytes != null) java.util.Arrays.fill(randomBytes, (byte) 0);
+        randomBytes = null;
+        if(currentRequestAad != null) java.util.Arrays.fill(currentRequestAad, (byte) 0);
+        currentRequestAad = null;
+        if(zeroTrustKeyPairs != null) zeroTrustKeyPairs.clear();
+    }
     public String getRandomBytes() { return Hex.getHex(this.randomBytes); }
 
     public void newRequest() {
         requestCount.incrementAndGet();
         lastRequest = LocalDateTime.now();
         recentRequests.add(0, lastRequest);
+    }
+
+    public boolean isExpirationEnabled() { return expirationEnabled; }
+    public int getMinutesTillInvalid() { return minutesTillInvalid; }
+    public boolean isExpired() {
+        return expirationEnabled && isActive && LocalDateTime.now().isAfter(lastRequest.plusMinutes(minutesTillInvalid));
     }
 
     public int getRequestCount() { return requestCount.get(); }

@@ -23,23 +23,23 @@ package com.fortrow.jflux.ssl;
 
 
 import java.io.File;
+import java.util.Objects;
 
-public class SslCertKeyPair {
+/** Files and credentials used to build a Java TLS context. */
+public final class SslCertKeyPair {
 
-    private File key;
-    private File cert;
-    private String password = null;
+    private final File key;
+    private final File cert;
+    private final String password;
 
     public SslCertKeyPair(File key, File cert) {
-        this.key = key;
-        this.cert = cert;
-        this.password = "password";
+        this(key, cert, "");
     }
 
     public SslCertKeyPair(File key, File cert, String password) {
-        this.key = key;
-        this.cert = cert;
-        this.password = password;
+        this.key = Objects.requireNonNull(key, "Private key file is required.");
+        this.cert = Objects.requireNonNull(cert, "Certificate file is required.");
+        this.password = password == null ? "" : password;
     }
 
     public File getKey() {

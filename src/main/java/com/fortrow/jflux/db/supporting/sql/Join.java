@@ -24,6 +24,8 @@ package com.fortrow.jflux.db.supporting.sql;
 import com.fortrow.jflux.db.supporting.SqlQuery;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class Join {
 
@@ -81,6 +83,10 @@ public class Join {
 
     public String getTable() {
         return table;
+    }
+
+    public List<Condition> conditions() {
+        return Collections.unmodifiableList(conditions);
     }
 
 }

@@ -29,6 +29,7 @@ import com.fortrow.jflux.db.supporting.DbType;
 import com.fortrow.jflux.exceptions.ExceptionHandling;
 import com.fortrow.jflux.files.LogFile;
 import com.fortrow.jflux.http.api.server.exceptions.APIException;
+import com.fortrow.jflux.http.api.server.session.SessionAllocationAuthenticator;
 import com.fortrow.jflux.http.api.server.types.CORSPolicy;
 import com.fortrow.jflux.http.api.server.types.APIServerType;
 import com.fortrow.jflux.http.api.types.DatabaseServerType;
@@ -36,7 +37,9 @@ import com.fortrow.jflux.ssl.keystore.JavaKeyStore;
 
 import javax.net.ssl.SSLContext;
 import java.net.InetSocketAddress;
+import java.nio.file.Path;
 import java.security.KeyStore;
+import java.time.Duration;
 import java.util.Map;
 
 public final class APIServerConfig {
@@ -59,11 +62,21 @@ public final class APIServerConfig {
     private boolean publicApi;
     private String apiPath = "/api";
     private String responsePath = "/response";
-    private int maxSessions = 100;
     private int minutesTillInvalid = 30;
+    private boolean sessionExpirationEnabled = true;
+    private int resumeTokenMinutes = 30;
+    private boolean activeSessionRecoveryEnabled = false;
+    private Path sessionResumeStorePath;
+    private Duration allocationChallengeLifetime = Duration.ofMinutes(5);
+    /** Retained only for source compatibility with the pre-assertion allocator. */
+    @Deprecated
+    private Duration allocationTokenLifetime = Duration.ofMinutes(5);
+    /** Retained only for source compatibility; signed assertions are now verified by JFlux. */
+    @Deprecated
+    private SessionAllocationAuthenticator sessionAllocationAuthenticator;
     private boolean useDynamicApiKey = false;
     private CORSPolicy corsPolicy;
-    private String[] encryptedSessionPaths = new String[]{"session/init", "session/close"};
+    private String[] encryptedSessionPaths = new String[]{"session/init", "session/close", "session/resume", "session/reset", "session/allocate", "session/heartbeat"};
     private LogFile log = new LogFile();
     private DatabaseServerType applicationDbType = null;
     private DatabaseServerType sessionDbType = null;
@@ -165,8 +178,34 @@ public final class APIServerConfig {
     }
 
     public APIServerConfig setSessionResourcePaths(String sessionInitPath, String sessionClosePath) {
-        encryptedSessionPaths[0] = sessionInitPath;
-        encryptedSessionPaths[1] = sessionClosePath;
+        return setSessionResourcePaths(sessionInitPath, sessionClosePath, "session/resume", "session/reset", "session/allocate", "session/heartbeat");
+    }
+
+    /** Configures all encrypted session lifecycle endpoints. */
+    public APIServerConfig setSessionResourcePaths(String sessionInitPath, String sessionClosePath,
+                                                   String sessionResumePath, String sessionResetPath) {
+        return setSessionResourcePaths(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, "session/allocate", "session/heartbeat");
+    }
+
+    /** Configures encrypted lifecycle endpoints, including per-key capacity allocation. */
+    public APIServerConfig setSessionResourcePaths(String sessionInitPath, String sessionClosePath,
+                                                   String sessionResumePath, String sessionResetPath,
+                                                   String sessionAllocatePath) {
+        return setSessionResourcePaths(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath, "session/heartbeat");
+    }
+
+    /** Configures encrypted lifecycle endpoints, including the authenticated session heartbeat. */
+    public APIServerConfig setSessionResourcePaths(String sessionInitPath, String sessionClosePath,
+                                                   String sessionResumePath, String sessionResetPath,
+                                                   String sessionAllocatePath, String sessionHeartbeatPath) {
+        encryptedSessionPaths = new String[]{
+                normalizeSessionPath(sessionInitPath, "session init path"),
+                normalizeSessionPath(sessionClosePath, "session close path"),
+                normalizeSessionPath(sessionResumePath, "session resume path"),
+                normalizeSessionPath(sessionResetPath, "session reset path"),
+                normalizeSessionPath(sessionAllocatePath, "session allocate path"),
+                normalizeSessionPath(sessionHeartbeatPath, "session heartbeat path")
+        };
         return this;
     }
 
@@ -267,8 +306,82 @@ public final class APIServerConfig {
     }
 
     public APIServerConfig setMinutesTillInvalid(int minutesTillInvalid) {
-        this.minutesTillInvalid = minutesTillInvalid;
+        this.minutesTillInvalid = Math.max(1, minutesTillInvalid);
         return this;
+    }
+
+    /** Enables or disables expiration based on the last request time. */
+    public APIServerConfig setSessionExpirationEnabled(boolean enabled) {
+        this.sessionExpirationEnabled = enabled;
+        return this;
+    }
+
+    public APIServerConfig useSessionExpiration(boolean enabled) {
+        return setSessionExpirationEnabled(enabled);
+    }
+
+    /** Sets the inactivity period before a live session expires. */
+    public APIServerConfig setSessionExpirationMinutes(int minutes) {
+        return setMinutesTillInvalid(minutes);
+    }
+
+    /** Sets the lifetime of a closed session resume token. */
+    public APIServerConfig setResumeTokenMinutes(int minutes) {
+        this.resumeTokenMinutes = Math.max(1, minutes);
+        return this;
+    }
+
+    /** Allows explicit resume-token requests on authenticated heartbeat without closing the session. */
+    public APIServerConfig setActiveSessionRecoveryEnabled(boolean enabled) {
+        this.activeSessionRecoveryEnabled = enabled;
+        return this;
+    }
+
+    public boolean isActiveSessionRecoveryEnabled() { return activeSessionRecoveryEnabled; }
+
+    /** Sets how long a manual allocation challenge remains usable. */
+    public APIServerConfig setAllocationChallengeMinutes(int minutes) {
+        this.allocationChallengeLifetime = Duration.ofMinutes(Math.max(1, minutes));
+        return this;
+    }
+
+    /**
+     * @deprecated Allocation tokens are no longer minted. The external
+     * authentication backend signs a short-lived allocation assertion instead.
+     */
+    @Deprecated
+    public APIServerConfig setAllocationTokenMinutes(int minutes) {
+        this.allocationTokenLifetime = Duration.ofMinutes(Math.max(1, minutes));
+        return this;
+    }
+
+    /**
+     * @deprecated JFlux does not receive username, password, or MFA values.
+     * Keep this setter only so applications can migrate without a source break;
+     * it is not consulted by the encrypted allocation endpoint.
+     */
+    @Deprecated
+    public APIServerConfig setSessionAllocationAuthenticator(SessionAllocationAuthenticator authenticator) {
+        this.sessionAllocationAuthenticator = authenticator;
+        return this;
+    }
+
+    /** Configures an optional durable server-side resume-token metadata file. */
+    public APIServerConfig setSessionResumeStorePath(Path path) {
+        this.sessionResumeStorePath = path == null ? null : path.toAbsolutePath().normalize();
+        return this;
+    }
+
+    public APIServerConfig setSessionResumeStorePath(String path) {
+        if(path == null || path.isBlank()) {
+            this.sessionResumeStorePath = null;
+            return this;
+        }
+        try {
+            return setSessionResumeStorePath(Path.of(path));
+        } catch (RuntimeException ex) {
+            throw ExceptionHandling.invalid("Session resume store path is invalid.", ex);
+        }
     }
 
     public APIServerConfig setCorsPolicy(CORSPolicy policy) {
@@ -316,8 +429,12 @@ public final class APIServerConfig {
         return this;
     }
 
+    /**
+     * @deprecated Global max-session limits are ignored since 1.1.1. Use
+     * {@code session/allocate} for each API key instead.
+     */
+    @Deprecated(since = "1.1.1")
     public APIServerConfig setMaxSessions(int val) {
-        this.maxSessions = Math.max(1, val);
         return this;
     }
 
@@ -345,7 +462,7 @@ public final class APIServerConfig {
     }
 
     public String[] getEncryptedSessionPaths() {
-        return encryptedSessionPaths;
+        return java.util.Arrays.copyOf(encryptedSessionPaths, encryptedSessionPaths.length);
     }
 
     public InetSocketAddress getBindAddress() {
@@ -400,6 +517,34 @@ public final class APIServerConfig {
         return minutesTillInvalid;
     }
 
+    public boolean isSessionExpirationEnabled() {
+        return sessionExpirationEnabled;
+    }
+
+    public int getResumeTokenMinutes() {
+        return resumeTokenMinutes;
+    }
+
+    public Duration getAllocationChallengeLifetime() {
+        return allocationChallengeLifetime;
+    }
+
+    /** @deprecated Allocation tokens are no longer used. */
+    @Deprecated
+    public Duration getAllocationTokenLifetime() {
+        return allocationTokenLifetime;
+    }
+
+    /** @deprecated The encrypted API now verifies signed assertions directly. */
+    @Deprecated
+    public SessionAllocationAuthenticator getSessionAllocationAuthenticator() {
+        return sessionAllocationAuthenticator;
+    }
+
+    public Path getSessionResumeStorePath() {
+        return sessionResumeStorePath;
+    }
+
     public CORSPolicy getCorsPolicy() {
         return this.corsPolicy;
     }
@@ -428,8 +573,10 @@ public final class APIServerConfig {
         return requestsPerMinute;
     }
 
+    /** @deprecated Global max-session limits are no longer enforced. */
+    @Deprecated(since = "1.1.1")
     public int getMaxSessions() {
-        return maxSessions;
+        return 1;
     }
 
     public int getRequestThreads() {
@@ -454,6 +601,15 @@ public final class APIServerConfig {
 
     public int getMaxRequestBodyBytes() {
         return maxRequestBodyBytes;
+    }
+
+    private static String normalizeSessionPath(String value, String label) {
+        if(value == null || value.isBlank()) throw ExceptionHandling.invalid(label + " is required.");
+        String normalized = value.trim();
+        while(normalized.startsWith("/")) normalized = normalized.substring(1);
+        while(normalized.endsWith("/") && !normalized.isEmpty()) normalized = normalized.substring(0, normalized.length() - 1);
+        if(normalized.isBlank() || normalized.contains("..")) throw ExceptionHandling.invalid(label + " is invalid.");
+        return normalized;
     }
 
     public String getResponsePath() {
@@ -504,6 +660,8 @@ public final class APIServerConfig {
         if(asyncMaxPollMs < asyncMinPollMs) throw new APIException("API async maximum poll interval cannot be less than the minimum poll interval.");
         if(asyncTimeoutMs < asyncMaxPollMs) throw new APIException("API async timeout cannot be less than the maximum poll interval.");
         if(maxRequestBodyBytes <= 0) throw new APIException("API maximum request body size must be greater than zero.");
+        if(minutesTillInvalid <= 0) throw new APIException("API session expiration minutes must be greater than zero.");
+        if(resumeTokenMinutes <= 0) throw new APIException("API resume-token lifetime must be greater than zero.");
         if(upgradePortHttps > 0 && !isUseHttp3()) throw new APIException("HTTPS upgrade port is only supported for HTTP/3 servers.");
         if(upgradePortHttps > 0 && apiServerSslContext == null) throw new APIException("HTTPS upgrade port requires an SSL context.");
         validateDatabaseConfig(applicationDbType, applicationDbDetailsProvider, false, "application");

@@ -21,36 +21,39 @@
  */
 package com.fortrow.jflux.ssl.keystore;
 
-import com.fortrow.jflux.encoding.BaseX;
+import com.fortrow.jflux.exceptions.ExceptionHandling;
 import com.fortrow.jflux.ssl.SslCertKeyPair;
 
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
-import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.KeyFactory;
 import java.security.KeyStore;
-import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
-import java.security.interfaces.RSAPrivateKey;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
 
 public class JavaKeyStore {
 
     private SSLContext context;
     private KeyStore keyStore;
 
+    /** @deprecated A Let's Encrypt request requires domain and account configuration. */
+    @Deprecated
     public static JavaKeyStore createLetsEncrypt() {
-        return null;
+        throw ExceptionHandling.unsupported("Use LetsEncrypt.request(...) before constructing JavaKeyStore.");
     }
 
     public JavaKeyStore(SslCertKeyPair pair) {
@@ -70,81 +73,95 @@ public class JavaKeyStore {
     }
 
     private SSLContext getContext(SslCertKeyPair pair, String tlsVersion) {
-        SSLContext context;
+        if (pair == null) throw ExceptionHandling.invalid("TLS certificate and key pair is required.");
+        if (!pair.getKey().isFile() || !pair.getCert().isFile()) {
+            throw ExceptionHandling.invalid("TLS private key and certificate files must exist.");
+        }
         String password = pair.getPassword();
         try {
-            context = SSLContext.getInstance("TLS" + tlsVersion);
-
-            byte[] certBytes = parseDERFromPEM(getBytes(pair.getCert()),
-                    "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----");
-            byte[] keyBytes = parseDERFromPEM(
-                    getBytes(pair.getKey()),
-                    "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----");
-
-            X509Certificate cert = generateCertificateFromDER(certBytes);
-            RSAPrivateKey key = generatePrivateKeyFromDER(keyBytes);
+            SSLContext context = SSLContext.getInstance(normalizeTlsVersion(tlsVersion));
+            List<X509Certificate> certificates = generateCertificates(Files.readAllBytes(pair.getCert().toPath()));
+            if (certificates.isEmpty()) throw new CertificateException("Certificate PEM did not contain an X.509 certificate.");
+            byte[] keyBytes = parsePrivateKey(Files.readAllBytes(pair.getKey().toPath()));
+            var key = generatePrivateKeyFromDER(keyBytes);
 
             KeyStore keystore = KeyStore.getInstance("JKS");
             keystore.load(null);
-            keystore.setCertificateEntry("cert-alias", cert);
-            keystore.setKeyEntry("key-alias", key, password.toCharArray(), new Certificate[]{cert});
+            Certificate[] chain = certificates.toArray(Certificate[]::new);
+            keystore.setCertificateEntry("cert-alias", chain[0]);
+            keystore.setKeyEntry("key-alias", key, password.toCharArray(), chain);
             this.keyStore = keystore;
 
-            KeyManagerFactory kmf = KeyManagerFactory.getInstance("SunX509");
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
             kmf.init(keystore, password.toCharArray());
 
-            TrustManagerFactory tmf = TrustManagerFactory.getInstance("SunX509");
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
             tmf.init(keystore);
-
-            KeyManager[] km = kmf.getKeyManagers();
-
-            SecureRandom random = new SecureRandom();
-            byte[] bytes = new byte[32]; //20?
-            random.nextBytes(bytes);
-
-            context.init(km, tmf.getTrustManagers(), random);
+            context.init(kmf.getKeyManagers(), tmf.getTrustManagers(), new SecureRandom());
+            return context;
         } catch (Exception e) {
-            e.printStackTrace();
-            context = null;
+            throw ExceptionHandling.failure("Unable to initialize TLS key store.", e);
         }
-        return context;
     }
 
-    private static byte[] parseDERFromPEM(byte[] pem, String beginDelimiter, String endDelimiter) {
-        String data = new String(pem);
-        String[] tokens = data.split(beginDelimiter);
-        tokens = tokens[1].split(endDelimiter);
-        return BaseX.bytesFrom64(tokens[0].replaceAll("\\s", ""));
+    private static String normalizeTlsVersion(String value) {
+        if (value == null || value.isBlank()) return "TLS";
+        String normalized = value.trim().toUpperCase(java.util.Locale.ROOT);
+        if (!normalized.startsWith("TLS")) normalized = "TLS" + normalized;
+        if (!normalized.matches("TLSV1\\.(2|3)")) {
+            throw ExceptionHandling.invalid("Only TLSv1.2 and TLSv1.3 are supported.");
+        }
+        return normalized.equals("TLSV1.2") ? "TLSv1.2" : "TLSv1.3";
     }
 
-    private static RSAPrivateKey generatePrivateKeyFromDER(byte[] keyBytes)
-            throws InvalidKeySpecException, NoSuchAlgorithmException {
+    private static byte[] parsePrivateKey(byte[] pem) {
+        String data = new String(pem, StandardCharsets.US_ASCII);
+        String begin = "-----BEGIN PRIVATE KEY-----";
+        String end = "-----END PRIVATE KEY-----";
+        int start = data.indexOf(begin);
+        int finish = data.indexOf(end, start + begin.length());
+        if (start < 0 || finish < 0) {
+            throw ExceptionHandling.invalid("Only PKCS#8 PEM private keys are supported.");
+        }
+        String encoded = data.substring(start + begin.length(), finish).replaceAll("\\s", "");
+        try {
+            return Base64.getDecoder().decode(encoded);
+        } catch (IllegalArgumentException e) {
+            throw ExceptionHandling.invalid("TLS private key PEM is not valid Base64.", e);
+        }
+    }
+
+    private static List<X509Certificate> generateCertificates(byte[] pem) throws CertificateException {
+        String data = new String(pem, StandardCharsets.US_ASCII);
+        String begin = "-----BEGIN CERTIFICATE-----";
+        String end = "-----END CERTIFICATE-----";
+        ArrayList<X509Certificate> certificates = new ArrayList<>();
+        int cursor = 0;
+        CertificateFactory factory = CertificateFactory.getInstance("X.509");
+        while (true) {
+            int start = data.indexOf(begin, cursor);
+            if (start < 0) break;
+            int finish = data.indexOf(end, start + begin.length());
+            if (finish < 0) throw new CertificateException("Certificate PEM is missing its end marker.");
+            String encoded = data.substring(start + begin.length(), finish).replaceAll("\\s", "");
+            try {
+                byte[] der = Base64.getDecoder().decode(encoded);
+                certificates.add((X509Certificate) factory.generateCertificate(new java.io.ByteArrayInputStream(der)));
+            } catch (IllegalArgumentException e) {
+                throw new CertificateException("Certificate PEM is not valid Base64.", e);
+            }
+            cursor = finish + end.length();
+        }
+        return certificates;
+    }
+
+    private static java.security.PrivateKey generatePrivateKeyFromDER(byte[] keyBytes)
+            throws InvalidKeySpecException, java.security.NoSuchAlgorithmException {
         PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(keyBytes);
 
         KeyFactory factory = KeyFactory.getInstance("RSA");
 
-        return (RSAPrivateKey) factory.generatePrivate(spec);
-    }
-
-    private static X509Certificate generateCertificateFromDER(byte[] certBytes)
-            throws CertificateException {
-        CertificateFactory factory = CertificateFactory.getInstance("X.509");
-
-        return (X509Certificate) factory.generateCertificate(new ByteArrayInputStream(certBytes));
-    }
-
-    private static byte[] getBytes(File file) {
-        byte[] bytesArray = new byte[(int) file.length()];
-
-        FileInputStream fis = null;
-        try {
-            fis = new FileInputStream(file);
-            fis.read(bytesArray); //read file into bytes[]
-            fis.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        return bytesArray;
+        return factory.generatePrivate(spec);
     }
 
 }
