@@ -45,6 +45,7 @@ public class EncryptedResponse {
     private ResponseHeaders headers;
     private String ciphertext;
     private String body;
+    private byte[] binaryBody;
     private JSONObject data;
     private EncryptedResponseType responseType;
     private String nextAuthorization;
@@ -95,6 +96,30 @@ public class EncryptedResponse {
             }
         }
     }
+
+    /** Verifies ratchet metadata and authenticates raw ciphertext before exposing binary plaintext. */
+    public static EncryptedResponse binary(int status, ResponseHeaders headers, byte[] ciphertext,
+            String apiKey, String secret, String activeSecret, String random, PublicKey serverPublic,
+            PrivateKey clientPrivate, byte[] aad) {
+        EncryptedResponse response = new EncryptedResponse(status, headers, "", apiKey, secret,
+                activeSecret, random, serverPublic, clientPrivate, EncryptedResponseType.EXECUTE_RESOURCE, false, aad);
+        response.data = new JSONObject();
+        response.data.put("request_status", status >= 200 && status < 300 ? "success" : "error");
+        if (!"1".equals(headers.getString("X-JFlux-Binary-Encrypted"))) response.verified = false;
+        if (response.verified) {
+            try {
+                response.binaryBody = new EncryptedPayload("", response.currentSecretKey, response.currentIv, aad).decryptBytes(ciphertext);
+            } catch (RuntimeException error) {
+                response.verified = false;
+                response.binaryBody = null;
+                new APIException("Binary encrypted response authentication failed.", error).tryReport();
+            }
+        }
+        return response;
+    }
+
+    /** Returns a defensive copy only after complete response authentication. */
+    public byte[] getBodyBytes() { return verified && binaryBody != null ? binaryBody.clone() : new byte[0]; }
 
     public int getStatus() { return this.status; }
     public ResponseHeaders getHeaders() { return this.headers; }

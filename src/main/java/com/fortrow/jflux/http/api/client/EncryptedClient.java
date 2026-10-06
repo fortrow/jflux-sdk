@@ -1,21 +1,21 @@
 /*
  * -------------------------------------------------------------------------
- * 
+ *
  * Copyright (c) 2026 Fortrow LLC. All rights reserved.
- *  
- * NOTICE: All information contained herein is, and remains the property of 
- * Fortrow, LLC. The intellectual and technical concepts contained herein are 
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
+ *
+ * NOTICE: All information contained herein is, and remains the property of
+ * Fortrow, LLC. The intellectual and technical concepts contained herein are
+ * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents,
  * patents in process, and are protected by trade secret or copyright law.
- * 
- * Dissemination of this information or reproduction of this material is 
- * strictly forbidden unless prior written permission is obtained from 
+ *
+ * Dissemination of this information or reproduction of this material is
+ * strictly forbidden unless prior written permission is obtained from
  * Fortrow, LLC.
- * 
+ *
  * -------------------------------------------------------------------------
- * 
+ *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-10 22:56:32 EDT
- * 
+ *
  * -------------------------------------------------------------------------
 
  */
@@ -65,6 +65,8 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 public class EncryptedClient implements AutoCloseable {
+    private final java.util.concurrent.locks.ReentrantLock exchangeLock = new java.util.concurrent.locks.ReentrantLock();
+
 
     private static final int DEFAULT_ASYNC_TIMEOUT_MS = 15_000;
 
@@ -72,9 +74,12 @@ public class EncryptedClient implements AutoCloseable {
     private CloseableHttpClient http1Client;
     private java.net.http.HttpClient http3Client;
     private ClosableHttp3Transport http3Transport;
+    private EncryptedWebSocketTransport webSocketTransport;
     private HttpVersion httpVersion;
     private boolean allowSelfSigned;
     private MtlsConfig mtlsConfig;
+    private SSLContext webSocketSslContext;
+    private Duration webSocketRequestTimeout = EncryptedWebSocketTransport.DEFAULT_REQUEST_TIMEOUT;
 
     private String endpointUri = "";
     private String http3UpgradeUri;
@@ -163,59 +168,103 @@ public class EncryptedClient implements AutoCloseable {
         return this;
     }
 
+    /** Configures the client TLS context used when the endpoint is wss://. */
+    public EncryptedClient setWebSocketSslContext(SSLContext sslContext) {
+        if (!isWebSocketEndpoint()) throw ExceptionHandling.invalid("A WebSocket SSL context requires a ws:// or wss:// endpoint.");
+        if (webSocketTransport != null) throw ExceptionHandling.invalid("WebSocket TLS configuration must be set before build().");
+        if (sslContext == null) throw ExceptionHandling.invalid("WebSocket SSL context is required.");
+        this.webSocketSslContext = sslContext;
+        return this;
+    }
+
+    /** Sets the timeout for one encrypted WebSocket request/response exchange. */
+    public EncryptedClient setWebSocketRequestTimeout(Duration timeout) {
+        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw ExceptionHandling.invalid("WebSocket request timeout must be positive.");
+        }
+        this.webSocketRequestTimeout = timeout;
+        if (webSocketTransport != null) webSocketTransport.setRequestTimeout(timeout);
+        return this;
+    }
+
     public EncryptedClient build() {
-        if(closed) throw ExceptionHandling.failure("Encrypted API client has already been closed.", null);
-        if(http1Client != null || http3Transport != null) return this;
-        if(httpVersion == HttpVersion.HTTP_1) {
-            try {
-                SSLContextBuilder builder = new SSLContextBuilder();
-                if (mtlsConfig != null) {
-                    char[] identityPassword = mtlsConfig.identityPassword();
-                    try {
-                        builder.loadKeyMaterial(loadKeyStore(mtlsConfig.identityStore(),
-                                mtlsConfig.identityStoreType(), identityPassword), identityPassword);
-                    } finally {
-                        java.util.Arrays.fill(identityPassword, '\0');
+        exchangeLock.lock();
+        try {
+            if(closed) throw ExceptionHandling.failure("Encrypted API client has already been closed.", null);
+            if(webSocketTransport != null || http1Client != null || http3Transport != null) return this;
+            if (isWebSocketEndpoint()) {
+                try {
+                    webSocketTransport = new EncryptedWebSocketTransport(URI.create(endpointUri))
+                            .setRequestTimeout(webSocketRequestTimeout);
+                    if (mtlsConfig != null) {
+                        if (webSocketSslContext != null) throw ExceptionHandling.invalid("Configure either mTLS material or a custom WebSocket SSL context, not both.");
+                        webSocketTransport.setSslContext(TlsMaterial.buildSslContext(mtlsConfig, allowSelfSigned));
+                    } else if (webSocketSslContext != null) webSocketTransport.setSslContext(webSocketSslContext);
+                    else if (allowSelfSigned) webSocketTransport.allowSelfSigned();
+                    if (!webSocketTransport.connect()) {
+                        webSocketTransport.close();
+                        webSocketTransport = null;
+                        throw ExceptionHandling.failure("Unable to connect to the encrypted API WebSocket server.", null);
                     }
-                    if (mtlsConfig.hasTrustStore()) {
-                        char[] trustPassword = mtlsConfig.trustStorePassword();
+                    return this;
+                } catch (Exception e) {
+                    if (webSocketTransport != null) webSocketTransport.close();
+                    webSocketTransport = null;
+                    throw ExceptionHandling.failure("Unable to initialize the encrypted API WebSocket client.", e);
+                }
+            }
+            if(httpVersion == HttpVersion.HTTP_1) {
+                try {
+                    SSLContextBuilder builder = new SSLContextBuilder();
+                    if (mtlsConfig != null) {
+                        char[] identityPassword = mtlsConfig.identityPassword();
                         try {
-                            builder.loadTrustMaterial(loadKeyStore(mtlsConfig.trustStore(),
-                                    mtlsConfig.trustStoreType(), trustPassword), null);
+                            builder.loadKeyMaterial(loadKeyStore(mtlsConfig.identityStore(),
+                                    mtlsConfig.identityStoreType(), identityPassword), identityPassword);
                         } finally {
-                            java.util.Arrays.fill(trustPassword, '\0');
+                            java.util.Arrays.fill(identityPassword, '\0');
                         }
-                    } else if (allowSelfSigned) {
+                        if (mtlsConfig.hasTrustStore()) {
+                            char[] trustPassword = mtlsConfig.trustStorePassword();
+                            try {
+                                builder.loadTrustMaterial(loadKeyStore(mtlsConfig.trustStore(),
+                                        mtlsConfig.trustStoreType(), trustPassword), null);
+                            } finally {
+                                java.util.Arrays.fill(trustPassword, '\0');
+                            }
+                        } else if (allowSelfSigned) {
+                            builder.loadTrustMaterial(null, new TrustSelfSignedStrategy());
+                        } else {
+                            builder.loadTrustMaterial(null, (TrustStrategy) null);
+                        }
+                    } else if(allowSelfSigned) {
                         builder.loadTrustMaterial(null, new TrustSelfSignedStrategy());
                     } else {
                         builder.loadTrustMaterial(null, (TrustStrategy) null);
                     }
-                } else if(allowSelfSigned) {
-                    builder.loadTrustMaterial(null, new TrustSelfSignedStrategy());
-                } else {
-                    builder.loadTrustMaterial(null, (TrustStrategy) null);
+                    sslContext = builder.build();
+                    var clientBuilder = HttpClients.custom().setSSLContext(sslContext);
+                    if (allowSelfSigned) clientBuilder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
+                    http1Client = clientBuilder.build();
+                } catch (NoSuchAlgorithmException | KeyManagementException | KeyStoreException e) {
+                    throw ExceptionHandling.failure("Unable to initialize encrypted API TLS client.", e);
+                } catch (java.security.GeneralSecurityException | IOException e) {
+                    throw ExceptionHandling.failure("Unable to initialize encrypted API TLS client.", e);
                 }
-                sslContext = builder.build();
-                var clientBuilder = HttpClients.custom().setSSLContext(sslContext);
-                if (allowSelfSigned) clientBuilder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
-                http1Client = clientBuilder.build();
-            } catch (NoSuchAlgorithmException | KeyManagementException | KeyStoreException e) {
-                throw ExceptionHandling.failure("Unable to initialize encrypted API TLS client.", e);
-            } catch (java.security.GeneralSecurityException | IOException e) {
-                throw ExceptionHandling.failure("Unable to initialize encrypted API TLS client.", e);
+            } else if(httpVersion == HttpVersion.HTTP_3) {
+                try {
+                    String upgradeSource = http3UpgradeUri;
+                    if(upgradeSource == null && endpointUri.startsWith("http://")) upgradeSource = endpointUri;
+                    endpointUri = Http3UpgradeResolver.resolveEndpoint(endpointUri, upgradeSource, allowSelfSigned, mtlsConfig);
+                } catch (IOException e) {
+                    throw ExceptionHandling.failure("Failed to resolve HTTP/3 upgrade endpoint.", e);
+                }
+                http3Transport = ClosableHttp3Transport.create(endpointUri, allowSelfSigned, mtlsConfig);
+                http3Client = http3Transport.client();
             }
-        } else if(httpVersion == HttpVersion.HTTP_3) {
-            try {
-                String upgradeSource = http3UpgradeUri;
-                if(upgradeSource == null && endpointUri.startsWith("http://")) upgradeSource = endpointUri;
-                endpointUri = Http3UpgradeResolver.resolveEndpoint(endpointUri, upgradeSource, allowSelfSigned, mtlsConfig);
-            } catch (IOException e) {
-                throw ExceptionHandling.failure("Failed to resolve HTTP/3 upgrade endpoint.", e);
-            }
-            http3Transport = ClosableHttp3Transport.create(endpointUri, allowSelfSigned, mtlsConfig);
-            http3Client = http3Transport.client();
-        }
-        return this;
+            return this;
+
+        } finally { exchangeLock.unlock(); }
     }
 
     private static KeyStore loadKeyStore(Path path, String type, char[] password)
@@ -297,7 +346,11 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     public void discardSessionState() {
-        clearSessionState();
+        exchangeLock.lock();
+        try {
+            clearSessionState();
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public String currentReconnectSessionSecret() {
@@ -305,49 +358,65 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     public void restoreReconnectSessionSecret(String rawSecret) {
-        persistAuthenticatedSessionSecret(rawSecret);
+        exchangeLock.lock();
+        try {
+            persistAuthenticatedSessionSecret(rawSecret);
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public void checkpointReconnectSessionSecret() {
-        persistAuthenticatedSessionSecret(pastSecret);
+        exchangeLock.lock();
+        try {
+            persistAuthenticatedSessionSecret(pastSecret);
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public EncryptedResponse closeSessionOrThrow() throws APIException {
-        return closeSessionOrThrow(false);
+        exchangeLock.lock();
+        try {
+            return closeSessionOrThrow(false);
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public EncryptedResponse closeSessionOrThrow(boolean createResumeToken) throws APIException {
-        if(!hasActiveSession()) throw new APIException("Encrypted session has not been initialized.");
-        if(sessionClosePath == null || sessionClosePath.isBlank()) throw new APIException("Encrypted session close path is not configured.");
+        exchangeLock.lock();
+        try {
+            if(!hasActiveSession()) throw new APIException("Encrypted session has not been initialized.");
+            if(sessionClosePath == null || sessionClosePath.isBlank()) throw new APIException("Encrypted session close path is not configured.");
 
-        JSONObject closeBody = new JSONObject();
-        if (createResumeToken) closeBody.put("create_resume_token", true);
-        EncryptedResponse response = request(sessionClosePath, closeBody, EncryptedResponseType.SESSION_CLOSE, false);
-        if(response == null) throw new APIException("No response was returned from session close.");
-        if(response.getStatus() != 200 || !"success".equals(response.getRequestStatus())) {
-            throw new APIException("Encrypted session close was not successful. status=" + response.getStatus() + ", body=" + response.getBody());
-        }
-        if(!response.isVerified()) throw new APIException("Encrypted session close response authorization failed.");
-
-        persistAuthenticatedSessionSecret(this.pastSecret);
-        if (createResumeToken) {
-            String resumeToken = stringValue(response.getBodyObject().get("resume_token"));
-            if (resumeToken.isBlank()) {
-                clearSessionState();
-                throw new APIException("Session close did not return the requested resume token.");
+            JSONObject closeBody = new JSONObject();
+            if (createResumeToken) closeBody.put("create_resume_token", true);
+            EncryptedResponse response = request(sessionClosePath, closeBody, EncryptedResponseType.SESSION_CLOSE, false);
+            if(response == null) throw new APIException("No response was returned from session close.");
+            if(response.getStatus() != 200 || !"success".equals(response.getRequestStatus())) {
+                throw new APIException("Encrypted session close was not successful. status=" + response.getStatus() + ", body=" + response.getBody());
             }
-            try {
-                resumeTokenStore.write(resumeToken);
-            } catch (RuntimeException ex) {
-                clearSessionState();
-                throw new APIException("Unable to persist the encrypted session resume token.", ex);
-            }
-        } else {
-            clearResumeToken();
-        }
+            if(!response.isVerified()) throw new APIException("Encrypted session close response authorization failed.");
 
-        clearSessionState();
-        return response;
+            persistAuthenticatedSessionSecret(this.pastSecret);
+            if (createResumeToken) {
+                String resumeToken = stringValue(response.getBodyObject().get("resume_token"));
+                if (resumeToken.isBlank()) {
+                    clearSessionState();
+                    throw new APIException("Session close did not return the requested resume token.");
+                }
+                try {
+                    resumeTokenStore.write(resumeToken);
+                } catch (RuntimeException ex) {
+                    clearSessionState();
+                    throw new APIException("Unable to persist the encrypted session resume token.", ex);
+                }
+            } else {
+                clearResumeToken();
+            }
+
+            clearSessionState();
+            return response;
+
+        } finally { exchangeLock.unlock(); }
     }
 
     /** Sends an authenticated encrypted heartbeat without closing the session. */
@@ -410,47 +479,110 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     private EncryptedResponse request(String path, RequestType resourceMethod, JSONObject body, EncryptedResponseType responseType, boolean updateRequestVars) throws APIException {
+        exchangeLock.lock();
+        try {
 
-        if(closed) throw new APIException("Encrypted API client is closed.");
+            if(closed) throw new APIException("Encrypted API client is closed.");
 
-        String fixedPath = fixPath(path);
-        if(!hasActiveSession()) throw new APIException("Encrypted API session has not been initialized.");
-        HashMap<String, String> headers = new HashMap<String, String>();
+            String fixedPath = fixPath(path);
+            if(!hasActiveSession()) throw new APIException("Encrypted API session has not been initialized.");
+            HashMap<String, String> headers = new HashMap<String, String>();
 
-        String timestamp = "" + Instant.now().getEpochSecond();
-        String sequence = String.valueOf(++requestSequence);
-        JSONObject requestBody = body == null ? new JSONObject() : new JSONObject(body);
-        boolean sessionCloseRequest = isSessionClosePath(fixedPath);
-        if(sessionCloseRequest) authorizeSessionClose(requestBody, sequence);
-        String plaintext = JSON.getString(requestBody);
-        String contentType = "application/json";
-        String logicalMethod = normalizeResourceMethod(resourceMethod);
+            String timestamp = "" + Instant.now().getEpochSecond();
+            String sequence = String.valueOf(++requestSequence);
+            JSONObject requestBody = body == null ? new JSONObject() : new JSONObject(body);
+            boolean sessionCloseRequest = isSessionClosePath(fixedPath);
+            if(sessionCloseRequest) authorizeSessionClose(requestBody, sequence);
+            String plaintext = JSON.getString(requestBody);
+            String contentType = "application/json";
+            String logicalMethod = normalizeResourceMethod(resourceMethod);
 
-        headers.put("Content-Type", contentType);
-        headers.put("Content-Transfer-Encoding", "x-encrypted-base64");
+            headers.put("Content-Type", contentType);
+            headers.put("Content-Transfer-Encoding", "x-encrypted-base64");
 
-        headers.put("X-Api-Key", apiKey);
-        headers.put("X-Api-Session-Id", sessionId);
-        headers.put("X-Api-Session-Authorization", nextSessionAuthorization);
-        headers.put("X-Api-Authorization", nextAuthorization);
-        headers.put("X-Api-Random-Bytes", nextRandom);
-        headers.put("X-Api-Key-Set-Id", keySetId);
-        headers.put("X-Request-Sequence", sequence);
-        headers.put("X-Request-Timestamp", timestamp);
-        if(!sessionCloseRequest) headers.put("X-Api-Resource-Method", logicalMethod);
+            headers.put("X-Api-Key", apiKey);
+            headers.put("X-Api-Session-Id", sessionId);
+            headers.put("X-Api-Session-Authorization", nextSessionAuthorization);
+            headers.put("X-Api-Authorization", nextAuthorization);
+            headers.put("X-Api-Random-Bytes", nextRandom);
+            headers.put("X-Api-Key-Set-Id", keySetId);
+            headers.put("X-Request-Sequence", sequence);
+            headers.put("X-Request-Timestamp", timestamp);
+            if(!sessionCloseRequest) headers.put("X-Api-Resource-Method", logicalMethod);
 
-        String signedResourceMethod = sessionCloseRequest ? "POST" : logicalMethod;
-        byte[] aad = APIKeys.requestAad("POST", fixedPath, timestamp, sequence, apiKey, sessionId, keySetId, nextRandom, contentType, signedResourceMethod);
-        byte[] encrypted = AES.gcm(plaintext.getBytes(StandardCharsets.UTF_8), Hex.fromHex(activeSecret), Hex.fromHex(nextRandom), aad, true);
-        if (encrypted == null) {
-            throw new APIException("Failed to encrypt request payload.");
-        }
-        String encryptedRequest = BaseX.encode64(encrypted);
-        String signature = APIKeys.requestSignature(secret, activeSecret, apiKey, sessionId, "POST", fixedPath, timestamp, sequence, keySetId, nextRandom, contentType, encryptedRequest, signedResourceMethod);
-        headers.put("X-Request-Signature", signature);
+            String signedResourceMethod = sessionCloseRequest ? "POST" : logicalMethod;
+            byte[] aad = APIKeys.requestAad("POST", fixedPath, timestamp, sequence, apiKey, sessionId, keySetId, nextRandom, contentType, signedResourceMethod);
+            byte[] encrypted = AES.gcm(plaintext.getBytes(StandardCharsets.UTF_8), Hex.fromHex(activeSecret), Hex.fromHex(nextRandom), aad, true);
+            if (encrypted == null) {
+                throw new APIException("Failed to encrypt request payload.");
+            }
+            String encryptedRequest = BaseX.encode64(encrypted);
+            String signature = APIKeys.requestSignature(secret, activeSecret, apiKey, sessionId, "POST", fixedPath, timestamp, sequence, keySetId, nextRandom, contentType, encryptedRequest, signedResourceMethod);
+            headers.put("X-Request-Signature", signature);
 
-        return post(fixedPath, encryptedRequest, headers, aad, responseType, updateRequestVars);
+            return post(fixedPath, encryptedRequest, headers, aad, responseType, updateRequestVars);
 
+
+        } finally { exchangeLock.unlock(); }
+    }
+
+    /** Sends arbitrary encrypted resource bytes over WSS; session controls remain text. */
+    public EncryptedResponse requestBytes(String path, RequestType resourceMethod, byte[] plaintext) throws APIException {
+        exchangeLock.lock();
+        try {
+
+            if(closed) throw new APIException("Encrypted API client is closed.");
+            if (!"wss".equalsIgnoreCase(URI.create(endpointUri).getScheme()) || allowSelfSigned || webSocketTransport == null || mtlsConfig == null)
+                throw new APIException("Binary API requires a built WSS client with validating mTLS configuration.");
+            if (plaintext == null || plaintext.length > com.fortrow.jflux.http.api.server.containers.EncryptedPayload.MAX_BINARY_PLAINTEXT_BYTES)
+                throw new APIException("Binary request size is invalid.");
+
+            String fixedPath = fixPath(path);
+            if(!hasActiveSession()) throw new APIException("Encrypted API session has not been initialized.");
+            HashMap<String, String> headers = new HashMap<String, String>();
+
+            String timestamp = "" + Instant.now().getEpochSecond();
+            String sequence = String.valueOf(++requestSequence);
+            boolean sessionCloseRequest = isSessionClosePath(fixedPath);
+            if (sessionCloseRequest || fixedPath.equals(fixPath(sessionInitPath))) throw new APIException("Binary session controls are unsupported.");
+            String contentType = "application/octet-stream";
+            String logicalMethod = normalizeResourceMethod(resourceMethod);
+
+            headers.put("Content-Type", contentType);
+            headers.put("Content-Transfer-Encoding", "x-encrypted-base64");
+
+            headers.put("X-Api-Key", apiKey);
+            headers.put("X-Api-Session-Id", sessionId);
+            headers.put("X-Api-Session-Authorization", nextSessionAuthorization);
+            headers.put("X-Api-Authorization", nextAuthorization);
+            headers.put("X-Api-Random-Bytes", nextRandom);
+            headers.put("X-Api-Key-Set-Id", keySetId);
+            headers.put("X-Request-Sequence", sequence);
+            headers.put("X-Request-Timestamp", timestamp);
+            if(!sessionCloseRequest) headers.put("X-Api-Resource-Method", logicalMethod);
+
+            String signedResourceMethod = sessionCloseRequest ? "POST" : logicalMethod;
+            byte[] aad = APIKeys.requestAad("POST", fixedPath, timestamp, sequence, apiKey, sessionId, keySetId, nextRandom, contentType, signedResourceMethod);
+            byte[] encrypted = AES.gcm(plaintext, Hex.fromHex(activeSecret), Hex.fromHex(nextRandom), aad, true);
+            if (encrypted == null) {
+                throw new APIException("Failed to encrypt request payload.");
+            }
+            String encryptedRequest = BaseX.encode64(encrypted);
+            String signature = APIKeys.requestSignature(secret, activeSecret, apiKey, sessionId, "POST", fixedPath, timestamp, sequence, keySetId, nextRandom, contentType, encryptedRequest, signedResourceMethod);
+            headers.put("X-Request-Signature", signature);
+
+            var response = webSocketTransport.executeBinary("POST", fixedPath, headers, encrypted);
+            var verified = EncryptedResponse.binary(response.status(), new ResponseHeaders(response.headers()), response.ciphertext(),
+                    apiKey, secret, activeSecret, sessionRandom, serverPublic, clientPrivate, aad);
+            setRequestVars(verified);
+            return verified;
+
+
+        } finally { exchangeLock.unlock(); }
+    }
+
+    public EncryptedResponse postBytes(String path, byte[] plaintext) throws APIException {
+        return requestBytes(path, RequestType.POST, plaintext);
     }
 
     public EncryptedResponse requestAndWait(String path, JSONObject body) throws APIException {
@@ -576,34 +708,46 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     public boolean beginSession(String sessionInitPath, String sessionClosePath) {
+        exchangeLock.lock();
+        try {
 
-        return beginSession(sessionInitPath, sessionClosePath, "/session/resume", "/session/reset", "/session/allocate");
+            return beginSession(sessionInitPath, sessionClosePath, "/session/resume", "/session/reset", "/session/allocate");
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public boolean beginSession(String sessionInitPath, String sessionClosePath,
                                 String sessionResumePath, String sessionResetPath,
                                 String sessionAllocatePath) {
-        return beginSession(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath, "/session/heartbeat");
+        exchangeLock.lock();
+        try {
+            return beginSession(sessionInitPath, sessionClosePath, sessionResumePath, sessionResetPath, sessionAllocatePath, "/session/heartbeat");
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public boolean beginSession(String sessionInitPath, String sessionClosePath,
                                 String sessionResumePath, String sessionResetPath,
                                 String sessionAllocatePath, String sessionHeartbeatPath) {
+        exchangeLock.lock();
+        try {
 
-        if(sessionInitPath == null || sessionInitPath.isBlank()) throw ExceptionHandling.invalid("Encrypted session init path is required.");
-        if(sessionClosePath == null || sessionClosePath.isBlank()) throw ExceptionHandling.invalid("Encrypted session close path is required.");
+            if(sessionInitPath == null || sessionInitPath.isBlank()) throw ExceptionHandling.invalid("Encrypted session init path is required.");
+            if(sessionClosePath == null || sessionClosePath.isBlank()) throw ExceptionHandling.invalid("Encrypted session close path is required.");
 
-        this.sessionInitPath = fixPath(sessionInitPath);
-        this.sessionClosePath = fixPath(sessionClosePath);
-        this.sessionResumePath = fixPath(sessionResumePath);
-        this.sessionResetPath = fixPath(sessionResetPath);
-        this.sessionAllocatePath = fixPath(sessionAllocatePath);
-        this.sessionHeartbeatPath = fixPath(sessionHeartbeatPath);
-        this.sessionSecret = SHA.get256(currentRawSessionSecret());
+            this.sessionInitPath = fixPath(sessionInitPath);
+            this.sessionClosePath = fixPath(sessionClosePath);
+            this.sessionResumePath = fixPath(sessionResumePath);
+            this.sessionResetPath = fixPath(sessionResetPath);
+            this.sessionAllocatePath = fixPath(sessionAllocatePath);
+            this.sessionHeartbeatPath = fixPath(sessionHeartbeatPath);
+            this.sessionSecret = SHA.get256(currentRawSessionSecret());
 
-        if (!readOptionalSecret(resumeTokenStore).isBlank() && resume()) return true;
-        return init();
+            if (!readOptionalSecret(resumeTokenStore).isBlank() && resume()) return true;
+            return init();
 
+
+        } finally { exchangeLock.unlock(); }
     }
 
     public void beginSessionOrThrow(String sessionInitPath, String sessionClosePath) throws APIException {
@@ -638,6 +782,13 @@ public class EncryptedClient implements AutoCloseable {
     private EncryptedResponse get(String path, HashMap<String, String> requestHeaders, EncryptedResponseType responseType) throws APIException {
 
         try {
+
+            if (isWebSocketEndpoint()) {
+                if (webSocketTransport == null) throw new APIException("Encrypted WebSocket client has not been built.");
+                EncryptedWebSocketTransport.Response response = webSocketTransport.execute("GET", path, requestHeaders, "");
+                return new EncryptedResponse(response.status(), new ResponseHeaders(response.headers()), response.body(),
+                        this.apiKey, this.secret, this.activeSecret, this.sessionRandom, serverPublic, clientPrivate, responseType, true);
+            }
 
             ExecutesClientRequest httpRequest;
             if(httpVersion == HttpVersion.HTTP_1) {
@@ -681,6 +832,12 @@ public class EncryptedClient implements AutoCloseable {
                         APIKeys.sessionResetAuthorization(secret, apiKey, timestamp, randomBytes));
             }
             String requestBody = JSON.getString(body == null ? new JSONObject() : body);
+            if (isWebSocketEndpoint()) {
+                if (webSocketTransport == null) throw new APIException("Encrypted WebSocket client has not been built.");
+                EncryptedWebSocketTransport.Response response = webSocketTransport.execute("POST", path, headers, requestBody);
+                return new EncryptedResponse(response.status(), new ResponseHeaders(response.headers()), response.body(),
+                        apiKey, secret, activeSecret, sessionRandom, serverPublic, clientPrivate, responseType, null);
+            }
             HttpEntity entity = new StringEntity(requestBody);
             ExecutesClientRequest httpRequest;
             if(httpVersion == HttpVersion.HTTP_1) {
@@ -703,6 +860,15 @@ public class EncryptedClient implements AutoCloseable {
     private EncryptedResponse post(String path, String encryptedRequest, HashMap<String, String> requestHeaders, byte[] aad, EncryptedResponseType responseType, boolean updateRequestVars) throws APIException {
 
         try {
+
+            if (isWebSocketEndpoint()) {
+                if (webSocketTransport == null) throw new APIException("Encrypted WebSocket client has not been built.");
+                EncryptedWebSocketTransport.Response response = webSocketTransport.execute("POST", path, requestHeaders, encryptedRequest);
+                EncryptedResponse encryptedResponse = new EncryptedResponse(response.status(), new ResponseHeaders(response.headers()), response.body(),
+                        this.apiKey, this.secret, this.activeSecret, this.sessionRandom, serverPublic, clientPrivate, responseType, aad);
+                if (updateRequestVars) setRequestVars(encryptedResponse);
+                return encryptedResponse;
+            }
 
             HttpEntity entity = new StringEntity(encryptedRequest);
 
@@ -829,26 +995,39 @@ public class EncryptedClient implements AutoCloseable {
 
     @Override
     public void close() {
-        if(closed) return;
-        closed = true;
-        if(http3Transport != null) {
-            http3Transport.close();
-            http3Transport = null;
-            http3Client = null;
-        }
-        if(http1Client instanceof java.io.Closeable closeable) {
-            try {
-                closeable.close();
-            } catch (IOException ignored) {
-            }
-            http1Client = null;
-        }
-        sslContext = null;
+        exchangeLock.lock();
         try {
-            Runtime.getRuntime().removeShutdownHook(shutdownHook);
-        } catch (IllegalStateException ignored) {
-            // JVM shutdown is already in progress.
-        }
+            if(closed) return;
+            closed = true;
+            if(http3Transport != null) {
+                http3Transport.close();
+                http3Transport = null;
+                http3Client = null;
+            }
+            if (webSocketTransport != null) {
+                webSocketTransport.close();
+                webSocketTransport = null;
+            }
+            if(http1Client instanceof java.io.Closeable closeable) {
+                try {
+                    closeable.close();
+                } catch (IOException ignored) {
+                }
+                http1Client = null;
+            }
+            sslContext = null;
+            try {
+                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+            } catch (IllegalStateException ignored) {
+                // JVM shutdown is already in progress.
+            }
+
+        } finally { exchangeLock.unlock(); }
+    }
+
+    private boolean isWebSocketEndpoint() {
+        return endpointUri.regionMatches(true, 0, "ws://", 0, 5)
+                || endpointUri.regionMatches(true, 0, "wss://", 0, 6);
     }
 
     private boolean setKeyVars(EncryptedResponse response) {

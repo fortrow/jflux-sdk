@@ -23,6 +23,7 @@ package com.fortrow.jflux.http.api.server.types;
 
 public enum ContentType {
     TEXT,
+    BINARY,
     JSON,
     URL_ENCODED,
     FORM_DATA,

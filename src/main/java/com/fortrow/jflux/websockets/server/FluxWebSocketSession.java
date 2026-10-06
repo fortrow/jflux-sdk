@@ -15,12 +15,25 @@ public final class FluxWebSocketSession {
     private final String id = UUID.randomUUID().toString();
     private final WebSocket socket;
     private final String resource;
+    private final TlsPeerIdentity peerIdentity;
     private final Map<String, Object> attributes = new ConcurrentHashMap<>();
 
     public FluxWebSocketSession(WebSocket socket, String resource) {
         this.socket = socket;
         this.resource = resource == null ? "" : resource;
+        this.peerIdentity = snapshotIdentity(socket);
     }
+
+    private static TlsPeerIdentity snapshotIdentity(WebSocket socket) {
+        if (socket == null || !socket.hasSSLSupport()) return null;
+        javax.net.ssl.SSLSession session = socket.getSSLSession();
+        try { session.getPeerCertificates(); }
+        catch (javax.net.ssl.SSLPeerUnverifiedException optionalClientAuth) { return null; }
+        return TlsPeerIdentity.fromVerifiedSession(session);
+    }
+
+    /** Handshake-derived identity, separate from mutable application attributes; null for plaintext WS. */
+    public TlsPeerIdentity peerIdentity() { return peerIdentity; }
 
     public String id() { return id; }
 
@@ -34,6 +47,24 @@ public final class FluxWebSocketSession {
 
     public InetSocketAddress localAddress() {
         return socket == null ? null : socket.getLocalSocketAddress();
+    }
+
+    /** Returns only the certificate chain verified by the actual TLS transport. */
+    public java.security.cert.X509Certificate[] verifiedPeerCertificates() {
+        if (socket == null || !socket.hasSSLSupport()) return new java.security.cert.X509Certificate[0];
+        try {
+            java.security.cert.Certificate[] chain = socket.getSSLSession().getPeerCertificates();
+            java.security.cert.X509Certificate[] result = new java.security.cert.X509Certificate[chain.length];
+            for (int i = 0; i < chain.length; i++) {
+                if (!(chain[i] instanceof java.security.cert.X509Certificate certificate)) {
+                    throw ExceptionHandling.failure("TLS peer returned a non-X509 certificate.", null);
+                }
+                result[i] = certificate;
+            }
+            return result;
+        } catch (javax.net.ssl.SSLPeerUnverifiedException e) {
+            throw ExceptionHandling.failure("TLS peer identity is not verified.", e);
+        }
     }
 
     public void sendText(String message) {

@@ -44,7 +44,7 @@ public class EncryptedPayload {
     public EncryptedPayload(String body, APIKeys keys, byte[] aad) {
         this.body = body;
         this.keys = keys;
-        this.aad = aad;
+        this.aad = aad == null ? null : aad.clone();
     }
 
     public EncryptedPayload(String body, String key, String nonce) {
@@ -55,22 +55,49 @@ public class EncryptedPayload {
         this.body = body;
         this.payloadKey = key;
         this.nonce = nonce;
-        this.aad = aad;
+        this.aad = aad == null ? null : aad.clone();
     }
 
+    /** Decrypts legacy Base64 ciphertext and decodes its UTF-8 plaintext. */
     public String decrypt() {
-        byte[] plaintext;
-        if(__.isset(keys)) {
-            byte[] key = Hex.fromHex(keys.getClientPayloadKey());
-            byte[] iv = Hex.fromHex(keys.getClientIv());
-            plaintext = AES.gcm(BaseX.bytesFrom64(this.body), key, iv, aad, false);
-        } else {
-            plaintext = AES.gcm(BaseX.bytesFrom64(this.body), Hex.fromHex(payloadKey), Hex.fromHex(nonce), aad, false);
+        byte[] key = Hex.fromHex(keys == null ? payloadKey : keys.getClientPayloadKey());
+        byte[] iv = Hex.fromHex(keys == null ? nonce : keys.getClientIv());
+        byte[] output = AES.gcm(BaseX.bytesFrom64(this.body), key, iv, aad, false);
+        if (output == null) throw new SecurityException("Encrypted payload authentication failed.");
+        return new String(output, StandardCharsets.UTF_8);
+    }
+
+    /** Authenticates raw ciphertext before returning arbitrary binary plaintext. */
+    public byte[] decryptBytes(byte[] ciphertext) {
+        if (ciphertext == null || ciphertext.length < 16 || ciphertext.length > MAX_BINARY_PLAINTEXT_BYTES + 16)
+            throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Binary ciphertext size is invalid.");
+        byte[] key = Hex.fromHex(keys == null ? payloadKey : keys.getClientPayloadKey());
+        byte[] iv = Hex.fromHex(keys == null ? nonce : keys.getClientIv());
+        return cryptBytes(ciphertext, key, iv, false);
+    }
+
+    /** Encrypts arbitrary binary plaintext using the current outbound payload key/nonce. */
+    public byte[] encryptBytes(byte[] plaintext) {
+        if (plaintext == null || plaintext.length > MAX_BINARY_PLAINTEXT_BYTES)
+            throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Binary plaintext size is invalid.");
+        byte[] key = Hex.fromHex(keys == null ? payloadKey : keys.getServerPayloadKey());
+        byte[] iv = Hex.fromHex(keys == null ? nonce : keys.getServerIv());
+        return cryptBytes(plaintext, key, iv, true);
+    }
+
+    public static final int MAX_BINARY_PLAINTEXT_BYTES = 4 * 1024 * 1024 - 16;
+
+    private byte[] cryptBytes(byte[] input, byte[] key, byte[] iv, boolean encrypt) {
+        try {
+            if (key == null || (key.length != 16 && key.length != 24 && key.length != 32) || iv == null || iv.length != 12)
+                throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Binary payload key or nonce size is invalid.");
+            byte[] output = AES.gcm(input, key, iv, aad, encrypt);
+            if (output == null) throw new SecurityException("Encrypted payload authentication failed.");
+            return output;
+        } finally {
+            if (key != null) java.util.Arrays.fill(key, (byte) 0);
+            if (iv != null) java.util.Arrays.fill(iv, (byte) 0);
         }
-        if (plaintext == null) {
-            throw new SecurityException("Encrypted payload authentication failed.");
-        }
-        return new String(plaintext, StandardCharsets.UTF_8);
     }
 
     public String encrypt(String plaintext) {

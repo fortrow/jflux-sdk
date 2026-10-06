@@ -38,6 +38,7 @@ import java.util.Map;
 public class BodyParameters {
 
     private String text;
+    private byte[] binaryBody;
     private HashMap<String, Object> values = new HashMap<String, Object>();
     private HashMap<String, Class<?>> expected = new HashMap<String, Class<?>>();
     private boolean valid = true;
@@ -47,7 +48,12 @@ public class BodyParameters {
     }
 
     public BodyParameters(String body, ContentType contentType, RequestHeaders headers, ClientSession session, boolean isEncrypted, byte[] aad) {
-        if(isEncrypted) decrypt(body, session, aad);
+        if (contentType == ContentType.BINARY) {
+            if (!isEncrypted || session == null) throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Binary payload requires authenticated encryption.");
+            binaryBody = new EncryptedPayload("", session.getSession().getApiKeys(), aad)
+                    .decryptBytes(com.fortrow.jflux.encoding.BaseX.bytesFrom64(body));
+            text = "";
+        } else if(isEncrypted) decrypt(body, session, aad);
         else this.text = body == null ? "" : body;
         parse(contentType, headers);
     }
@@ -71,6 +77,8 @@ public class BodyParameters {
     public boolean present(String key) { return __.isset(values.get(key)); }
 
     public String text() { return this.text; }
+
+    public byte[] bytes() { return binaryBody == null ? new byte[0] : binaryBody.clone(); }
 
     public String json() {
         return JSON.getString(new JSONObject(values));

@@ -39,6 +39,7 @@ public class APIResponse {
 
     private ResponseCode responseCode;
     private String response;
+    private byte[] binaryBody;
     private JSONObject responseObj = null;
     private JSONObject plainResponseObj = null;
     private ClientSession clientSession;
@@ -132,7 +133,26 @@ public class APIResponse {
 
     }
 
+    /** Creates a raw-byte response for an authenticated binary WebSocket resource. */
+    public static APIResponse binary(ClientSession session, byte[] body, ResponseCode code) {
+        if (body == null || body.length > EncryptedPayload.MAX_BINARY_PLAINTEXT_BYTES)
+            throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Binary response size is invalid.");
+        APIResponse response = new APIResponse(session, code);
+        response.binaryBody = body.clone();
+        response.contentType = ContentType.BINARY;
+        return response;
+    }
+
     public void encrypt() throws Exception {
+        if (binaryBody != null) {
+            byte[] ciphertext = new EncryptedPayload("", clientSession.getSession().getApiKeys(),
+                    clientSession.getSession().getCurrentRequestAad()).encryptBytes(binaryBody);
+            responseObj = new JSONObject();
+            responseObj.put("request_status", statusFor(responseCode));
+            responseObj.put("response", com.fortrow.jflux.encoding.BaseX.encode64(ciphertext));
+            response = JSON.getString(responseObj);
+            return;
+        }
         ensureResponseObject();
         if(!responseObj.containsKey("response")) {
             JSONObject payload = new JSONObject(responseObj);

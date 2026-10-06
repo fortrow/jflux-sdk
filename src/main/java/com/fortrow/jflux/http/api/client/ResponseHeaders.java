@@ -28,6 +28,7 @@ import org.apache.http.Header;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Locale;
 
 public class ResponseHeaders {
@@ -106,6 +107,15 @@ public class ResponseHeaders {
             return null;
         }
 
+    }
+
+    /** Creates response headers from transport-neutral name/value pairs. */
+    public ResponseHeaders(Map<String, String> headers) {
+        if (headers == null) return;
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (entry.getKey() == null || entry.getValue() == null) continue;
+            this.values.put(entry.getKey().toUpperCase(Locale.ROOT), entry.getValue());
+        }
     }
 
 }

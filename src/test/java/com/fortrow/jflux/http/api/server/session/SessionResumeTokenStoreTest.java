@@ -52,6 +52,20 @@ class SessionResumeTokenStoreTest {
     }
 
     @Test
+    void resumeConsumesAndInvalidatesTheSessionTokenSetTogether() throws Throwable {
+        SessionResumeTokenStore store = new SessionResumeTokenStore(null);
+        String token = store.issue("api-key", "api-secret", "session-1", Duration.ofMinutes(5));
+        String sibling = store.issue("api-key", "api-secret", "session-1", Duration.ofMinutes(5));
+
+        assertEquals(SessionResumeTokenStore.ConsumeResult.VALID,
+                store.consumeAndInvalidateForSession("api-key", "api-secret", token, "session-1"));
+        assertEquals(SessionResumeTokenStore.ConsumeResult.REPLAY,
+                store.consume("api-key", "api-secret", token));
+        assertEquals(SessionResumeTokenStore.ConsumeResult.REPLAY,
+                store.consume("api-key", "api-secret", sibling));
+    }
+
+    @Test
     void durableStoreDoesNotWriteRawTokensAndReloadsReservations() throws Throwable {
         Path path = Files.createTempFile("jflux-resume", ".json");
         try {

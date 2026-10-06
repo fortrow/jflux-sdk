@@ -37,7 +37,16 @@ public class FluxWebSocketClient extends WebSocketClient implements AutoCloseabl
 
     public FluxWebSocketClient(URI endpoint, Map<String, String> headers,
                                FluxWebSocketClientHandler handler) {
-        super(validateEndpoint(endpoint), headers == null ? Map.of() : Map.copyOf(headers));
+        this(endpoint, headers, handler, DEFAULT_MAX_MESSAGE_BYTES);
+    }
+
+    /** Sets the parser allocation bound before any connection is opened. */
+    public FluxWebSocketClient(URI endpoint, Map<String, String> headers,
+                               FluxWebSocketClientHandler handler, int parserLimitBytes) {
+        super(validateEndpoint(endpoint), new org.java_websocket.drafts.Draft_6455(
+                java.util.List.of(), parserLimitBytes), headers == null ? Map.of() : Map.copyOf(headers));
+        if (parserLimitBytes < 1) throw ExceptionHandling.invalid("Parser message limit must be positive.");
+        this.maxMessageBytes = parserLimitBytes;
         this.endpoint = endpoint;
         this.handler = handler == null ? new FluxWebSocketClientHandler() { } : handler;
     }

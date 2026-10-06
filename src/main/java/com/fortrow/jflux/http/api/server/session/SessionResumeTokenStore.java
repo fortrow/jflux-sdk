@@ -37,7 +37,36 @@ public final class SessionResumeTokenStore {
 
     public SessionResumeTokenStore(Path path) throws APIException {
         this.path = path == null ? null : path.toAbsolutePath().normalize();
+        verifyWritable();
         load();
+    }
+
+    /**
+     * Fails startup when the configured metadata file cannot be updated by the
+     * service account. Resume consumes a token before creating replacement
+     * session keys, so discovering a read-only store during a request would
+     * otherwise surface as an opaque HTTP 500 and leave recovery state stuck.
+     */
+    public synchronized void verifyWritable() throws APIException {
+        if (path == null) return;
+        try {
+            Path parent = path.getParent();
+            if (parent == null) parent = Path.of(".").toAbsolutePath().normalize();
+            Files.createDirectories(parent);
+            if (!Files.isDirectory(parent) || !Files.isReadable(parent) || !Files.isWritable(parent)) {
+                throw new IOException("Resume store parent is not readable and writable: " + parent);
+            }
+            if (Files.exists(path)) {
+                if (!Files.isRegularFile(path) || !Files.isReadable(path) || !Files.isWritable(path)) {
+                    throw new IOException("Resume store is not a readable and writable regular file: " + path);
+                }
+                return;
+            }
+            Path probe = Files.createTempFile(parent, path.getFileName().toString(), ".access-check");
+            Files.deleteIfExists(probe);
+        } catch (IOException | SecurityException ex) {
+            throw new APIException("Encrypted session resume store is not writable: " + path, ex);
+        }
     }
 
     public synchronized String issue(String apiKey, String secret, String sessionId, Duration lifetime) throws APIException {
@@ -71,14 +100,58 @@ public final class SessionResumeTokenStore {
         if (matching == null) return isTokenShape(token) ? ConsumeResult.REPLAY : ConsumeResult.UNKNOWN;
         if (matching.used()) return ConsumeResult.REPLAY;
         if (matching.expiresAtMs() <= System.currentTimeMillis()) {
-            replace(matching, new Entry(matching.tokenHash(), matching.apiKeyHash(), matching.sessionId(), matching.expiresAtMs(), true));
-            persist();
+            markConsumed(matching);
             return ConsumeResult.EXPIRED;
         }
         if (!SecureCompare.equals(matching.apiKeyHash(), hash(apiKey))) return ConsumeResult.API_KEY_MISMATCH;
         if (!verifyProof(apiKey, secret, matching.sessionId(), token)) return ConsumeResult.API_KEY_MISMATCH;
-        replace(matching, new Entry(matching.tokenHash(), matching.apiKeyHash(), matching.sessionId(), matching.expiresAtMs(), true));
-        persist();
+        markConsumed(matching);
+        return ConsumeResult.VALID;
+    }
+
+    /**
+     * Consumes a valid token and removes every other token for its session in
+     * one durable update. Resume must replace the old session atomically from
+     * the store's perspective; two separate writes can otherwise return 500
+     * after the token is consumed but before its siblings are invalidated.
+     */
+    public synchronized ConsumeResult consumeAndInvalidateForSession(
+            String apiKey, String secret, String token, String expectedSessionId) throws APIException {
+        if (apiKey == null || apiKey.isBlank() || secret == null || secret.isBlank()
+                || token == null || token.isBlank() || expectedSessionId == null || expectedSessionId.isBlank()) {
+            return ConsumeResult.UNKNOWN;
+        }
+        String tokenHash = hash(token);
+        Entry matching = null;
+        for (Entry entry : entries) {
+            if (SecureCompare.equals(entry.tokenHash(), tokenHash)) {
+                matching = entry;
+                break;
+            }
+        }
+        if (matching == null) return isTokenShape(token) ? ConsumeResult.REPLAY : ConsumeResult.UNKNOWN;
+        if (matching.used()) return ConsumeResult.REPLAY;
+        if (matching.expiresAtMs() <= System.currentTimeMillis()) {
+            markConsumed(matching);
+            return ConsumeResult.EXPIRED;
+        }
+        if (!SecureCompare.equals(matching.apiKeyHash(), hash(apiKey))
+                || !SecureCompare.equals(matching.sessionId(), expectedSessionId)
+                || !verifyProof(apiKey, secret, matching.sessionId(), token)) {
+            return ConsumeResult.API_KEY_MISMATCH;
+        }
+
+        List<Entry> previous = new ArrayList<>(entries);
+        Entry matchedEntry = matching;
+        entries.removeIf(entry -> SecureCompare.equals(entry.apiKeyHash(), matchedEntry.apiKeyHash())
+                && SecureCompare.equals(entry.sessionId(), matchedEntry.sessionId()));
+        try {
+            persist();
+        } catch (APIException ex) {
+            entries.clear();
+            entries.addAll(previous);
+            throw ex;
+        }
         return ConsumeResult.VALID;
     }
 
@@ -209,12 +282,23 @@ public final class SessionResumeTokenStore {
 
     private void pruneExpired() {
         long now = System.currentTimeMillis();
-        entries.removeIf(entry -> entry.expiresAtMs() <= now && entry.used());
+        entries.removeIf(entry -> entry.expiresAtMs() <= now);
     }
 
     private void replace(Entry oldEntry, Entry newEntry) {
         int index = entries.indexOf(oldEntry);
         if (index >= 0) entries.set(index, newEntry);
+    }
+
+    private void markConsumed(Entry matching) throws APIException {
+        Entry consumed = new Entry(matching.tokenHash(), matching.apiKeyHash(), matching.sessionId(), matching.expiresAtMs(), true);
+        replace(matching, consumed);
+        try {
+            persist();
+        } catch (APIException ex) {
+            replace(consumed, matching);
+            throw ex;
+        }
     }
 
     private static boolean verifyProof(String apiKey, String secret, String sessionId, String token) {

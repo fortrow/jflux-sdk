@@ -56,6 +56,7 @@ public final class APIServerConfig {
     private String apiServerKeystorePath = null;
     private SSLContext apiServerSslContext = null;
     private boolean needClientAuth = false;
+    private java.util.function.BiPredicate<String, com.fortrow.jflux.websockets.server.TlsPeerIdentity> peerIdentityAuthorizer;
     private boolean wantClientAuth = false;
     private KeyStore clientTrustStore = null;
     private JavaKeyStore keystore = null;
@@ -88,6 +89,14 @@ public final class APIServerConfig {
     private int asyncMaxPollMs = 1500;
     private int asyncTimeoutMs = 15000;
     private int maxRequestBodyBytes = 4 * 1024 * 1024;
+    private boolean webSocketEnabled = false;
+    private int webSocketPort = -1;
+    private String webSocketBindAddress = "";
+    private String webSocketPath = "/ws";
+    private int webSocketMaxMessageBytes = 4 * 1024 * 1024;
+    private int webSocketMaxPendingRequests = 128;
+    private boolean binaryWebSocketEnabled;
+    private SSLContext webSocketSslContext;
 
     public APIServerConfig(int port) {
         this.apiPort = port;
@@ -150,6 +159,18 @@ public final class APIServerConfig {
         this.wantClientAuth = wantClientAuth;
         if (wantClientAuth) this.needClientAuth = false;
         return this;
+    }
+
+    /** Requires a verified TLS identity and authorizes its binding to each presented API key. */
+    public APIServerConfig setPeerIdentityAuthorizer(java.util.function.BiPredicate<String,
+            com.fortrow.jflux.websockets.server.TlsPeerIdentity> authorizer) {
+        if (authorizer == null) throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Peer identity authorizer is required.");
+        this.peerIdentityAuthorizer = authorizer;
+        return this;
+    }
+
+    public java.util.function.BiPredicate<String, com.fortrow.jflux.websockets.server.TlsPeerIdentity> getPeerIdentityAuthorizer() {
+        return peerIdentityAuthorizer;
     }
 
     public boolean isNeedClientAuth() { return needClientAuth; }
@@ -461,6 +482,52 @@ public final class APIServerConfig {
         return this;
     }
 
+    /** Enables the encrypted API WebSocket transport on a separate listener. */
+    public APIServerConfig useWebSocket(int port) {
+        return setWebSocketPort(port).setWebSocketEnabled(true);
+    }
+
+    /** Enables or disables the encrypted API WebSocket transport. */
+    public APIServerConfig setWebSocketEnabled(boolean enabled) {
+        this.webSocketEnabled = enabled;
+        return this;
+    }
+
+    /** Sets the WebSocket listener port. Use zero to request an ephemeral port. */
+    public APIServerConfig setWebSocketPort(int port) {
+        this.webSocketPort = port;
+        return this;
+    }
+
+    /** Sets an optional WebSocket bind host; the API bind host is used by default. */
+    public APIServerConfig setWebSocketBindAddress(String bindAddress) {
+        this.webSocketBindAddress = bindAddress == null ? "" : bindAddress.trim();
+        return this;
+    }
+
+    /** Sets the WebSocket handshake path, independent of the HTTP API path. */
+    public APIServerConfig setWebSocketPath(String path) {
+        if (path == null || path.isBlank()) throw ExceptionHandling.invalid("WebSocket path is required.");
+        String normalized = path.trim();
+        if (!normalized.startsWith("/")) normalized = "/" + normalized;
+        while (normalized.length() > 1 && normalized.endsWith("/")) normalized = normalized.substring(0, normalized.length() - 1);
+        if (normalized.contains("..")) throw ExceptionHandling.invalid("WebSocket path is invalid.");
+        this.webSocketPath = normalized;
+        return this;
+    }
+
+    /** Sets the maximum UTF-8 WebSocket frame size accepted by the API transport. */
+    public APIServerConfig setWebSocketMaxMessageBytes(int maxMessageBytes) {
+        this.webSocketMaxMessageBytes = Math.max(1, maxMessageBytes);
+        return this;
+    }
+
+    /** Configures WSS. If omitted, the API server TLS context is reused when available. */
+    public APIServerConfig setWebSocketSslContext(SSLContext sslContext) {
+        this.webSocketSslContext = sslContext;
+        return this;
+    }
+
     public String[] getEncryptedSessionPaths() {
         return java.util.Arrays.copyOf(encryptedSessionPaths, encryptedSessionPaths.length);
     }
@@ -603,6 +670,41 @@ public final class APIServerConfig {
         return maxRequestBodyBytes;
     }
 
+    public boolean isWebSocketEnabled() { return webSocketEnabled; }
+
+    public int getWebSocketPort() { return webSocketPort; }
+
+    public InetSocketAddress getWebSocketBindAddress() {
+        String host = webSocketBindAddress.isBlank() ? bindAddress : webSocketBindAddress;
+        return host == null || host.isBlank()
+                ? new InetSocketAddress(webSocketPort)
+                : new InetSocketAddress(host, webSocketPort);
+    }
+
+    public String getWebSocketBindHost() { return webSocketBindAddress.isBlank() ? bindAddress : webSocketBindAddress; }
+
+    public String getWebSocketPath() { return webSocketPath; }
+
+    public int getWebSocketMaxMessageBytes() { return webSocketMaxMessageBytes; }
+
+    /** Bounds queued/running API WebSocket exchanges before virtual-thread submission. */
+    public APIServerConfig setWebSocketMaxPendingRequests(int maximum) {
+        if (maximum < 1 || maximum > 4096)
+            throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("WebSocket pending request bound must be between 1 and 4096.");
+        this.webSocketMaxPendingRequests = maximum;
+        return this;
+    }
+
+    public int getWebSocketMaxPendingRequests() { return webSocketMaxPendingRequests; }
+
+    /** Opts into encrypted byte resources; requires mandatory mTLS and peer/key authorization. */
+    public APIServerConfig setBinaryWebSocketEnabled(boolean enabled) { binaryWebSocketEnabled = enabled; return this; }
+    public boolean isBinaryWebSocketEnabled() { return binaryWebSocketEnabled; }
+
+
+
+    public SSLContext getWebSocketSslContext() { return webSocketSslContext; }
+
     private static String normalizeSessionPath(String value, String label) {
         if(value == null || value.isBlank()) throw ExceptionHandling.invalid(label + " is required.");
         String normalized = value.trim();
@@ -654,12 +756,19 @@ public final class APIServerConfig {
 
     public void validateOrThrow() throws APIException {
         if(corsPolicy != null) corsPolicy.validateOrThrow();
+        if (binaryWebSocketEnabled && (!webSocketEnabled || !needClientAuth || peerIdentityAuthorizer == null
+                || (webSocketSslContext == null && apiServerSslContext == null && !useTls)
+                || serverType != APIServerType.ENCRYPTED_SYNC))
+            throw new APIException("Binary WebSocket resources require encrypted sync, WSS, mandatory mTLS, and peer identity authorization.");
         if(requestThreads <= 0) throw new APIException("API request thread count must be greater than zero.");
         if(asyncThreads <= 0) throw new APIException("API async thread count must be greater than zero.");
         if(asyncMinPollMs <= 0) throw new APIException("API async minimum poll interval must be greater than zero.");
         if(asyncMaxPollMs < asyncMinPollMs) throw new APIException("API async maximum poll interval cannot be less than the minimum poll interval.");
         if(asyncTimeoutMs < asyncMaxPollMs) throw new APIException("API async timeout cannot be less than the maximum poll interval.");
         if(maxRequestBodyBytes <= 0) throw new APIException("API maximum request body size must be greater than zero.");
+        if(webSocketPort < -1 || webSocketPort > 65535) throw new APIException("API WebSocket port must be between 0 and 65535.");
+        if(webSocketEnabled && webSocketPort < 0) throw new APIException("Enabled API WebSocket transport requires a WebSocket port.");
+        if(webSocketMaxMessageBytes <= 0) throw new APIException("API WebSocket maximum message size must be greater than zero.");
         if(minutesTillInvalid <= 0) throw new APIException("API session expiration minutes must be greater than zero.");
         if(resumeTokenMinutes <= 0) throw new APIException("API resume-token lifetime must be greater than zero.");
         if(upgradePortHttps > 0 && !isUseHttp3()) throw new APIException("HTTPS upgrade port is only supported for HTTP/3 servers.");

@@ -37,12 +37,18 @@ public class FluxWebSocketServer extends WebSocketServer implements AutoCloseabl
     }
 
     public FluxWebSocketServer(String host, int port, FluxWebSocketHandler handler) throws UnknownHostException {
-        super(new InetSocketAddress(InetAddress.getByName(validateHost(host)), validatePort(port)));
-        this.handler = handler == null ? new FluxWebSocketHandler() { } : handler;
+        this(new InetSocketAddress(InetAddress.getByName(validateHost(host)), validatePort(port)), handler);
     }
 
     public FluxWebSocketServer(InetSocketAddress address, FluxWebSocketHandler handler) {
-        super(validateAddress(address));
+        this(address, handler, DEFAULT_MAX_MESSAGE_BYTES);
+    }
+
+    /** Sets the parser allocation bound before any connection is accepted. */
+    public FluxWebSocketServer(InetSocketAddress address, FluxWebSocketHandler handler, int parserLimitBytes) {
+        super(validateAddress(address), List.of(new org.java_websocket.drafts.Draft_6455(List.of(), parserLimitBytes)));
+        if (parserLimitBytes < 1) throw ExceptionHandling.invalid("Parser message limit must be positive.");
+        this.maxMessageBytes = parserLimitBytes;
         this.handler = handler == null ? new FluxWebSocketHandler() { } : handler;
     }
 
@@ -67,10 +73,16 @@ public class FluxWebSocketServer extends WebSocketServer implements AutoCloseabl
 
     /** Configures WSS before {@link #start()} is called. */
     public FluxWebSocketServer setSslContext(SSLContext sslContext) {
+        return setSslContext(sslContext, false);
+    }
+
+    /** Enables mandatory TLS client certificates when requireClientCertificate is true. */
+    public FluxWebSocketServer setSslContext(SSLContext sslContext, boolean requireClientCertificate) {
         if (started) throw ExceptionHandling.invalid("TLS configuration must be set before the WebSocket server starts.");
         if (sslContext == null) throw ExceptionHandling.invalid("WebSocket SSL context is required.");
         this.sslContext = sslContext;
-        setWebSocketFactory(new DefaultSSLWebSocketServerFactory(sslContext));
+        setWebSocketFactory(requireClientCertificate ? new ClientAuthWebSocketServerFactory(sslContext)
+                : new DefaultSSLWebSocketServerFactory(sslContext));
         return this;
     }
 

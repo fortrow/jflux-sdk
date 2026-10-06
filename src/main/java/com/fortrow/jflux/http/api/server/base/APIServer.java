@@ -1,21 +1,21 @@
 /*
  * -------------------------------------------------------------------------
- * 
+ *
  * Copyright (c) 2026 Fortrow LLC. All rights reserved.
- *  
- * NOTICE: All information contained herein is, and remains the property of 
- * Fortrow, LLC. The intellectual and technical concepts contained herein are 
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
+ *
+ * NOTICE: All information contained herein is, and remains the property of
+ * Fortrow, LLC. The intellectual and technical concepts contained herein are
+ * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents,
  * patents in process, and are protected by trade secret or copyright law.
- * 
- * Dissemination of this information or reproduction of this material is 
- * strictly forbidden unless prior written permission is obtained from 
+ *
+ * Dissemination of this information or reproduction of this material is
+ * strictly forbidden unless prior written permission is obtained from
  * Fortrow, LLC.
- * 
+ *
  * -------------------------------------------------------------------------
- * 
+ *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-10 22:53:45 EDT
- * 
+ *
  * -------------------------------------------------------------------------
 
  */
@@ -42,9 +42,13 @@ import com.fortrow.jflux.http.api.server.session.SessionResumeTokenStore;
 import com.fortrow.jflux.http.api.server.types.APIServerType;
 import com.fortrow.jflux.http.api.server.types.ContentType;
 import com.fortrow.jflux.http.api.types.EncryptedRequestType;
+import com.fortrow.jflux.http.api.websocket.EncryptedWebSocketMessage;
 import com.fortrow.jflux.output.json.JSON;
 import com.fortrow.jflux.threading.ThreadExecutor;
 import com.fortrow.jflux.todash.__;
+import com.fortrow.jflux.websockets.server.FluxWebSocketHandler;
+import com.fortrow.jflux.websockets.server.FluxWebSocketServer;
+import com.fortrow.jflux.websockets.server.FluxWebSocketSession;
 import com.sun.net.httpserver.*;
 import org.json.simple.JSONObject;
 import tech.kwik.core.log.SysOutLogger;
@@ -59,6 +63,7 @@ import tech.kwik.flupke.server.Http3ApplicationProtocolFactory;
 import javax.net.ssl.*;
 import java.io.*;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.http.HttpHeaders;
@@ -69,17 +74,24 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static com.fortrow.jflux.http.api.server.base.APIServer.RequestParser.queryToMap;
 import static tech.kwik.flupke.server.Http3ApplicationProtocolFactory.HTTP3_PROTOCOL_ID;
 
 public abstract class APIServer implements ClientFilter, APIEvents {
 
+    private static final String WEBSOCKET_REMOTE_ADDRESS_HEADER = "X-JFlux-WebSocket-Remote-Address";
+    private static final String WEBSOCKET_BRIDGE_TOKEN_HEADER = "X-JFlux-WebSocket-Bridge-Token";
+
     private final APIServerConfig config;
     private APIResources resources = new APIResources();
     private final ConcurrentHashMap<String, AsyncRequest> asyncResponses = new ConcurrentHashMap<>();
     private final ThreadExecutor requestExecutor;
     private final ThreadExecutor asyncExecutor;
+    private final Object sessionStateLock = new Object();
+    private final java.util.Set<String> activeExchangeKeys = ConcurrentHashMap.newKeySet();
     private final ArrayList<RemoteClient> clients = new ArrayList<RemoteClient>();
     private final ArrayList<ClientSession> clientSessions = new ArrayList<ClientSession>();
     private final ArrayList<APISession> pastSessions = new ArrayList<APISession>();
@@ -93,12 +105,24 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     private HttpServer upgradeServer;
     private HttpsServer httpsUpgradeServer;
     private ServerConnector http3ServerConnector;
+    private FluxWebSocketServer webSocketServer;
+    private ExecutorService webSocketExecutor;
+    private final java.util.concurrent.Semaphore webSocketAdmission;
+    private final boolean binaryWebSocketEnabled;
+    // Fixed stripes bound memory even for unrecognized caller-supplied keys. Collisions only add serialization.
+    private final java.util.concurrent.locks.ReentrantLock[] encryptedExchangeLocks = java.util.stream.IntStream.range(0, 4096)
+            .mapToObj(ignored -> new java.util.concurrent.locks.ReentrantLock()).toArray(java.util.concurrent.locks.ReentrantLock[]::new);
+    private final java.util.function.BiPredicate<String, com.fortrow.jflux.websockets.server.TlsPeerIdentity> peerIdentityAuthorizer;
+
 
     public APIServer(APIServerConfig config) throws APIException {
 
         config.validateOrThrow();
 
         this.config = config;
+        this.peerIdentityAuthorizer = config.getPeerIdentityAuthorizer();
+        this.webSocketAdmission = new java.util.concurrent.Semaphore(config.getWebSocketMaxPendingRequests());
+        this.binaryWebSocketEnabled = config.isBinaryWebSocketEnabled();
         this.requestExecutor = new ThreadExecutor(config.getRequestThreads());
         this.asyncExecutor = new ThreadExecutor(config.getAsyncThreads());
         this.isPublicApi = this.config.isPublicApi();
@@ -135,6 +159,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             startHttp1Server();
         }
 
+        if (config.isWebSocketEnabled()) startWebSocketServer();
+
     }
 
     public APIResource addResource(String value, String requestMethod, APIResource definition) {
@@ -144,6 +170,14 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     }
 
     public void stop() {
+        if(webSocketServer != null) {
+            webSocketServer.close();
+            webSocketServer = null;
+        }
+        if(webSocketExecutor != null) {
+            webSocketExecutor.shutdownNow();
+            webSocketExecutor = null;
+        }
         if(httpServer != null) {
             httpServer.stop(1);
             httpServer = null;
@@ -210,7 +244,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     }
 
     public ArrayList<ClientSession> getClientSessions() {
-        return clientSessions;
+        synchronized (sessionStateLock) { return new ArrayList<>(clientSessions); }
     }
 
     public APIResources getApiResources() {
@@ -232,46 +266,59 @@ public abstract class APIServer implements ClientFilter, APIEvents {
      * Invalidates every live session and outstanding token for one root API
      * key, then restores that key's capacity to one session.
      */
-    public synchronized void resetSessionsForApiKey(String apiKey) throws APIException {
+    public void resetSessionsForApiKey(String apiKey) throws APIException {
         if (apiKey == null || apiKey.isBlank()) return;
-        invalidateSessionsByApiKey(apiKey);
-        clients.removeIf(client -> SecureCompare.equals(client.getApiKey(), apiKey));
-        resumeTokenStore.invalidateForApiKey(apiKey);
-        sessionAllocationManager.invalidateApiKey(apiKey);
-        sessionCapacity.reset(apiKey);
+        var exchangeLock = encryptedExchangeLocks[Math.floorMod(apiKey.hashCode(), encryptedExchangeLocks.length)];
+        exchangeLock.lock();
+        try {
+            invalidateSessionsByApiKey(apiKey);
+            synchronized (sessionStateLock) { clients.removeIf(client -> SecureCompare.equals(client.getApiKey(), apiKey)); }
+            resumeTokenStore.invalidateForApiKey(apiKey);
+            sessionAllocationManager.invalidateApiKey(apiKey);
+            sessionCapacity.reset(apiKey);
+        } finally { exchangeLock.unlock(); }
     }
 
     private int activeSessionsForApiKey(String apiKey) {
-        int count = 0;
-        for (ClientSession session : clientSessions) {
-            if (sessionMatchesApiKey(session, apiKey)) count++;
+        synchronized (sessionStateLock) {
+            int count = 0;
+            for (ClientSession session : clientSessions) {
+                if (sessionMatchesApiKey(session, apiKey)) count++;
+            }
+            return count;
+
         }
-        return count;
     }
 
     /** Returns unique live-session IPs for an already authenticated limit response. */
     private List<String> sessionIpAddressesForApiKey(String apiKey) {
-        LinkedHashSet<String> addresses = new LinkedHashSet<>();
-        for (ClientSession session : clientSessions) {
-            if (!sessionMatchesApiKey(session, apiKey) || session.getClient() == null
-                    || session.getClient().getClientInfo() == null) continue;
-            String address = session.getClient().getClientInfo().getRemoteIp();
-            if (address != null && !address.isBlank()) addresses.add(address);
+        synchronized (sessionStateLock) {
+            LinkedHashSet<String> addresses = new LinkedHashSet<>();
+            for (ClientSession session : clientSessions) {
+                if (!sessionMatchesApiKey(session, apiKey) || session.getClient() == null
+                        || session.getClient().getClientInfo() == null) continue;
+                String address = session.getClient().getClientInfo().getRemoteIp();
+                if (address != null && !address.isBlank()) addresses.add(address);
+            }
+            return new ArrayList<>(addresses);
+
         }
-        return new ArrayList<>(addresses);
     }
 
     public void invalidateSession(ClientSession clientSession) {
+        synchronized (sessionStateLock) {
 
-        for(int i=clientSessions.size() - 1; i>=0; i--) {
-            if(clientSessions.get(i).equals(clientSession)) {
-                clientSession.getSession().deactivate();
-                sessionInvalidated(clientSession);
-                pastSessions.add(clientSession.getSession());
-                clientSessions.remove(i);
+            for(int i=clientSessions.size() - 1; i>=0; i--) {
+                if(clientSessions.get(i).equals(clientSession)) {
+                    clientSession.getSession().deactivate();
+                    sessionInvalidated(clientSession);
+                    pastSessions.add(clientSession.getSession());
+                    clientSessions.remove(i);
+                }
             }
-        }
 
+
+        }
     }
 
     private void lockSessionApiKey(ClientSession clientSession, String reason) {
@@ -292,14 +339,17 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     }
 
     private void invalidateSessionsByApiKey(String apiKey) {
-        for(int i=clientSessions.size() - 1; i>=0; i--) {
-            ClientSession current = clientSessions.get(i);
-            if(sessionMatchesApiKey(current, apiKey)) {
-                current.getSession().deactivate();
-                sessionInvalidated(current);
-                pastSessions.add(current.getSession());
-                clientSessions.remove(i);
+        synchronized (sessionStateLock) {
+            for(int i=clientSessions.size() - 1; i>=0; i--) {
+                ClientSession current = clientSessions.get(i);
+                if(sessionMatchesApiKey(current, apiKey)) {
+                    current.getSession().deactivate();
+                    sessionInvalidated(current);
+                    pastSessions.add(current.getSession());
+                    clientSessions.remove(i);
+                }
             }
+
         }
     }
 
@@ -533,6 +583,213 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         return colon >= 0 ? host.substring(0, colon) : host;
     }
 
+    private void startWebSocketServer() throws APIException {
+        try {
+            webSocketExecutor = Executors.newVirtualThreadPerTaskExecutor();
+            FluxWebSocketServer server = new FluxWebSocketServer(config.getWebSocketBindAddress(), new EncryptedApiWebSocketHandler(),
+                    config.getWebSocketMaxMessageBytes())
+                    .setMaxMessageBytes(config.getWebSocketMaxMessageBytes());
+            javax.net.ssl.SSLContext socketContext = config.getWebSocketSslContext();
+            if (socketContext == null && config.isUseTls()) socketContext = config.getApiServerSslContext();
+            if (socketContext != null) server.setSslContext(socketContext, config.isNeedClientAuth());
+            webSocketServer = server;
+            webSocketServer.start();
+        } catch (RuntimeException e) {
+            stop();
+            throw new APIException("Unable to start the encrypted API WebSocket transport.", e);
+        }
+    }
+
+    private final class EncryptedApiWebSocketHandler implements FluxWebSocketHandler {
+        @Override
+        public void onOpen(FluxWebSocketSession session, org.java_websocket.handshake.ClientHandshake handshake) {
+            String requestedPath = handshake == null ? "" : handshake.getResourceDescriptor();
+            int query = requestedPath.indexOf('?');
+            if (query >= 0) requestedPath = requestedPath.substring(0, query);
+            if (!config.getWebSocketPath().equals(requestedPath)) {
+                session.close(1008, "Invalid encrypted API WebSocket path.");
+            }
+        }
+
+        @Override
+        public void onText(FluxWebSocketSession session, String message) {
+            if (session == null || !session.isOpen()) return;
+            final EncryptedWebSocketMessage.Request request;
+            try {
+                request = EncryptedWebSocketMessage.parseRequest(message);
+            } catch (RuntimeException error) {
+                ExceptionHandling.report(error);
+                session.close(1008, "Invalid encrypted API WebSocket request.");
+                return;
+            }
+            try {
+                validateWebSocketMethod(request.method());
+            } catch (RuntimeException error) {
+                ExceptionHandling.report(error);
+                sendWebSocketError(session, request.requestId(), 405, "WebSocket API request method is not supported.");
+                return;
+            }
+            if (!webSocketAdmission.tryAcquire()) {
+                sendWebSocketError(session, request.requestId(), 503, "Encrypted API WebSocket is overloaded; retry after reconnect.");
+                session.close(1013, "Encrypted API WebSocket is overloaded.");
+                return;
+            }
+            try {
+                webSocketExecutor.execute(() -> {
+                    try { dispatchWebSocketRequest(session, request); }
+                    finally { webSocketAdmission.release(); }
+                });
+            } catch (RuntimeException error) {
+                webSocketAdmission.release();
+                ExceptionHandling.report(error);
+                sendWebSocketError(session, request.requestId(), 503, "Encrypted API WebSocket transport is unavailable.");
+            }
+        }
+
+        @Override
+        public void onBinary(FluxWebSocketSession session, java.nio.ByteBuffer message) {
+            if (session == null || !session.isOpen()) return;
+            if (!binaryWebSocketEnabled) { session.close(1003, "Binary API is disabled."); return; }
+            final com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.Message request;
+            try {
+                request = com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.decode(message);
+                if (request.response() || !"POST".equals(request.method())) throw ExceptionHandling.invalid("Binary API resource request required.");
+                String resource = resourceFromPath(config.getApiPath() + request.path());
+                if (Arrays.asList(config.getEncryptedSessionPaths()).contains(resource) || isAsyncResponseResource(resource))
+                    throw ExceptionHandling.invalid("Binary API session controls are unsupported.");
+                if (request.ciphertextLength() > config.getMaxRequestBodyBytes()) throw ExceptionHandling.invalid("Binary API body exceeds configured bound.");
+            } catch (RuntimeException error) { session.close(1008, "Invalid binary API request."); return; }
+            if (!webSocketAdmission.tryAcquire()) { session.close(1013, "Binary API overloaded."); return; }
+            try {
+                webSocketExecutor.execute(() -> {
+                    try {
+                        new APIServerHandler().handle(new WebSocketExchange(session, request));
+                    } catch (Exception error) { ExceptionHandling.report(error); session.close(1011, "Binary API exchange failed."); }
+                    finally { webSocketAdmission.release(); }
+                });
+            } catch (RuntimeException error) { webSocketAdmission.release(); session.close(1013, "Binary API unavailable."); }
+        }
+    }
+
+    /** Direct string/JSON dispatch: TLS identity never travels through request headers. */
+    private void dispatchWebSocketRequest(FluxWebSocketSession session, EncryptedWebSocketMessage.Request request) {
+        if (session == null || !session.isOpen()) return;
+        try {
+            new APIServerHandler().handle(new WebSocketExchange(session, request));
+        } catch (Exception error) {
+            ExceptionHandling.report(error);
+            sendWebSocketError(session, request.requestId(), 502, "Encrypted API WebSocket request failed.");
+        }
+    }
+
+    /** Adapter only; authentication remains in the shared dispatcher. */
+    private final class WebSocketExchange extends HttpExchange {
+        private final FluxWebSocketSession session;
+        private final EncryptedWebSocketMessage.Request request;
+        private final com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.Message binaryRequest;
+        private final Headers requestHeaders = new Headers();
+        private final Headers responseHeaders = new Headers();
+        private final com.fortrow.jflux.websockets.server.TlsPeerIdentity peerIdentity;
+        private int status = -1;
+        private boolean finished;
+        private final java.io.ByteArrayOutputStream responseBody = new java.io.ByteArrayOutputStream() {
+            @Override public void close() throws IOException { finish(); }
+        };
+        WebSocketExchange(FluxWebSocketSession session, EncryptedWebSocketMessage.Request request) {
+            this.session = session;
+            this.request = request;
+            this.binaryRequest = null;
+            this.peerIdentity = session.peerIdentity();
+            request.headers().forEach((key, value) -> {
+                if (!isHopByHopHeader(key) && !WEBSOCKET_REMOTE_ADDRESS_HEADER.equalsIgnoreCase(key)
+                        && !WEBSOCKET_BRIDGE_TOKEN_HEADER.equalsIgnoreCase(key)) requestHeaders.add(key, value);
+            });
+        }
+        WebSocketExchange(FluxWebSocketSession session, com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.Message binaryRequest) {
+            this.session = session;
+            this.binaryRequest = binaryRequest;
+            this.request = new EncryptedWebSocketMessage.Request(binaryRequest.requestId().toString(), binaryRequest.method(),
+                    binaryRequest.path(), binaryRequest.headers(), BaseX.encode64(binaryRequest.ciphertext()));
+            this.peerIdentity = session.peerIdentity();
+            request.headers().forEach((key, value) -> {
+                if (!isHopByHopHeader(key) && !WEBSOCKET_REMOTE_ADDRESS_HEADER.equalsIgnoreCase(key)
+                        && !WEBSOCKET_BRIDGE_TOKEN_HEADER.equalsIgnoreCase(key)) requestHeaders.add(key, value);
+            });
+        }
+        private void finish() throws IOException {
+            if (finished) return;
+            Map<String, String> headers = new LinkedHashMap<>();
+            responseHeaders.forEach((key, values) -> headers.put(key, String.join(", ", values)));
+            if (binaryRequest != null) {
+                Object parsed = JSON.parse(responseBody.toString(StandardCharsets.UTF_8));
+                byte[] body = responseBody.toByteArray();
+                if (parsed instanceof JSONObject object && object.get("response") instanceof String ciphertext) {
+                    body = BaseX.bytesFrom64(ciphertext);
+                    headers.put("X-JFlux-Binary-Encrypted", "1");
+                }
+                byte[] encoded = com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.encode(
+                        new com.fortrow.jflux.http.api.websocket.EncryptedBinaryWebSocketMessage.Message(binaryRequest.requestId(), true,
+                                status, "", "", headers, body));
+                if (encoded.length > config.getWebSocketMaxMessageBytes() || !session.isOpen())
+                    throw new IOException("Binary response exceeds configured bound or connection closed.");
+                session.sendBinary(java.nio.ByteBuffer.wrap(encoded));
+                finished = true;
+                return;
+            }
+            String encoded = EncryptedWebSocketMessage.response(request.requestId(), status, headers,
+                    responseBody.toString(StandardCharsets.UTF_8));
+            if (encoded.getBytes(StandardCharsets.UTF_8).length > config.getWebSocketMaxMessageBytes()) {
+                session.close(1009, "WebSocket response exceeds the configured maximum size.");
+                throw new IOException("WebSocket response exceeds the configured maximum size.");
+            }
+            if (!session.isOpen()) throw new IOException("WebSocket connection closed during response.");
+            session.sendText(encoded);
+            finished = true;
+        }
+        @Override public Headers getRequestHeaders() { return requestHeaders; }
+        @Override public Headers getResponseHeaders() { return responseHeaders; }
+        @Override public URI getRequestURI() { return URI.create(config.getApiPath() + request.path()); }
+        @Override public String getRequestMethod() { return request.method(); }
+        @Override public com.sun.net.httpserver.HttpContext getHttpContext() { return null; }
+        @Override public void close() { }
+        @Override public java.io.InputStream getRequestBody() {
+            return new java.io.ByteArrayInputStream(("GET".equals(request.method()) || "HEAD".equals(request.method())
+                    ? "" : request.body()).getBytes(StandardCharsets.UTF_8));
+        }
+        @Override public OutputStream getResponseBody() { return responseBody; }
+        @Override public void sendResponseHeaders(int code, long length) { status = code; }
+        @Override public InetSocketAddress getRemoteAddress() { return session.remoteAddress(); }
+        @Override public InetSocketAddress getLocalAddress() { return session.localAddress(); }
+        @Override public int getResponseCode() { return status; }
+        @Override public String getProtocol() { return "WEBSOCKET"; }
+        @Override public Object getAttribute(String key) { return null; }
+        @Override public void setAttribute(String key, Object value) { throw ExceptionHandling.unsupported("Transport attributes are immutable."); }
+        @Override public void setStreams(java.io.InputStream input, OutputStream output) { throw ExceptionHandling.unsupported("WebSocket streams cannot be replaced."); }
+        @Override public com.sun.net.httpserver.HttpPrincipal getPrincipal() { return null; }
+    }
+
+    private void sendWebSocketError(FluxWebSocketSession session, String requestId, int status, String message) {
+        if (session == null || !session.isOpen()) return;
+        try {
+            session.sendText(EncryptedWebSocketMessage.error(requestId, status, message));
+        } catch (RuntimeException error) {
+            ExceptionHandling.report(error);
+        }
+    }
+
+    private static void validateWebSocketMethod(String method) {
+        if (!Set.of("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE").contains(method)) {
+            throw ExceptionHandling.invalid("WebSocket API request method is not supported.");
+        }
+    }
+
+    private static boolean isHopByHopHeader(String name) {
+        if (name == null) return true;
+        return Set.of("connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+                "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade")
+                .contains(name.toLowerCase(Locale.ROOT));
+    }
+
     private void startHttp1Server() throws APIException {
         try {
             httpServer = HttpServer.create(config.getBindAddress(), 0);
@@ -578,7 +835,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     }
 
     public ArrayList<RemoteClient> getClients() {
-        return clients;
+        synchronized (sessionStateLock) { return new ArrayList<>(clients); }
     }
 
     public void setLogFile(LogFile file) {
@@ -587,6 +844,18 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
     public APIServerConfig getConfig() {
         return config;
+    }
+
+    /** Returns the encrypted API WebSocket listener, when enabled. */
+    public FluxWebSocketServer getWebSocketServer() { return webSocketServer; }
+
+    /** Returns the bound WebSocket port, or -1 when the transport is disabled. */
+    public int getWebSocketPort() {
+        return webSocketServer == null ? -1 : webSocketServer.getPort();
+    }
+
+    public boolean isWebSocketStarted() {
+        return webSocketServer != null && webSocketServer.isStarted();
     }
 
     private boolean isAsyncResponseResource(String resource) {
@@ -691,479 +960,130 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
 
-        @Override
-        public void handleRequest(HttpServerRequest t, HttpServerResponse r) throws IOException {
-
-            try {
-
-                final Headers headersObj = convertHeaders(t.headers());
-                final RequestHeaders headers = new RequestHeaders(headersObj);
-                final String inboundRequestMethod = t.method();
-
-                InetAddress inetAddress = t.clientAddress();
-                final String hostname = inetAddress.getHostName();
-                final String ipAddr = inetAddress.getHostAddress();
-
-                final String resource = resourceFromPath(t.path());
-
-                if (!RequestParser.verifyResource(getApiResources(), isEncrypted() ? config.getEncryptedSessionPaths() : new String[]{}, config.getResponsePath(), resource)) {
-                    log.write("Invalid resource '" + resource + "' requested.");
-                    failRequest(r, "Invalid resource.");
-                    return;
-                }
-
-                boolean isSessionResource = Arrays.asList(config.getEncryptedSessionPaths()).contains(resource);
-                boolean isResponseResource = isAsyncResponseResource(resource);
-                String requestMethod = isResponseResource ? "POST" : (isSessionResource ? getSessionRequestMethod(resource) : (isEncrypted() ? "POST" : inboundRequestMethod));
-
-                if (inboundRequestMethod.equals("OPTIONS")) {
-                    if (config.getCorsPolicy().isPermitted()) {
-                        sendResponse(r, 200, "", ContentType.TEXT);
-                        return;
-                    } else {
-                        log.write("Request blocked by CORS policy.");
-                        unauthorized(r);
-                        return;
-                    }
-                }
-
-                if (!inboundRequestMethod.equals(requestMethod)) {
-                    log.write("Invalid '" + requestMethod + "' request method used.");
-                    failRequest(r, "Invalid request method.");
-                    return;
-                }
-
-                if (!checkRequestHeaders(headers, resource)) {
-                    log.write("Invalid headers in request.");
-                    unauthorized(r);
-                    return;
-                }
-
-                Instant requestTimestamp = headers.getInstantFromTimestamp("X-Request-Timestamp");
-                if(isEncrypted() && (!isAfter(requestTimestamp, 30) || !isBefore(requestTimestamp, 30))) {
-                    unauthorized(r);
-                    log.write("Invalid timestamps in request headers.");
-                    return;
-                }
-
-                String resourceMethod = resolveResourceMethod(headers, inboundRequestMethod, isSessionResource, isResponseResource);
-                APIResource resolvedResource = resolveApiResource(resource, resourceMethod, isSessionResource, isResponseResource);
-                if(!isSessionResource && !isResponseResource && resolvedResource == null) {
-                    log.write("Invalid resource method '" + resourceMethod + "' for resource '" + resource + "'.");
-                    failRequest(r, "Invalid resource method.");
-                    return;
-                }
-
-                APIKeys apiKeys = null;
-
-                if (!isPublicApi && !headers.contains("X-Api-Key") && !isSessionBootstrapResource(resource)) {
-                    log.write("Missing 'X-Api-Key' header.");
-                    unauthorized(r);
-                    return;
-                }
-
-                final String reqBody;
-                try {
-                    reqBody = bodyFromStream(t.body());
-                } catch (RequestBodyTooLargeException ex) {
-                    log.write("Rejected request body larger than configured maximum.");
-                    tooLarge(r);
-                    return;
-                }
-
-                if (headers.contains("X-Api-Key")) {
-                    apiKeys = lookupApiKeys(headers.getString("X-Api-Key"));
-                }
-
-                if (!isPublicApi && apiKeys == null) {
-                    log.write("API Keys in request could not be validated.");
-                    unauthorized(r);
-                    return;
-                }
-
-                if(!isPublicApi && !apiKeys.ipIsAllowed(ipAddr)) {
-                    log.write("Unallowed IP address in request for API key: '" + apiKeys.getKey() + "'.");
-                    unauthorized(r);
-                    return;
-                }
-
-                invalidateOldSessions();
-
-                if (isSessionResetResource(resource) || isSessionAllocateResource(resource)) {
-                    APIResponse controlResponse;
-                    try {
-                        controlResponse = isSessionResetResource(resource)
-                                ? handleSessionReset(apiKeys, headers)
-                                : handleSessionAllocate(apiKeys, headers, reqBody);
-                    } catch (APIException ex) {
-                        ExceptionHandling.report(ex);
-                        serverError(r);
-                        return;
-                    }
-                    sendControlResponse(r, controlResponse);
-                    return;
-                }
-
-                boolean earlyResumeAuthorized = false;
-                if (isSessionResumeResource(resource)) {
-                    JSONObject resumeRequest = parseControlObject(reqBody);
-                    String resumeToken = controlString(resumeRequest, "resume_token");
-                    String resumedSessionId = resumeTokenStore.sessionForToken(apiKeys.getKey(), apiKeys.getSecret(), resumeToken);
-                    earlyResumeAuthorized = resumedSessionId != null
-                            && resumeTokenStore.isEarlyToken(apiKeys.getKey(), apiKeys.getSecret(), resumedSessionId, resumeToken);
-                    if (!earlyResumeAuthorized && !rootSessionAuthorizationValid(headers, apiKeys)) {
-                        unauthorized(r);
-                        return;
-                    }
-                    SessionResumeTokenStore.ConsumeResult resumeResult;
-                    try {
-                        resumeResult = resumeTokenStore.consume(apiKeys.getKey(), apiKeys.getSecret(), controlString(resumeRequest, "resume_token"));
-                    } catch (APIException ex) {
-                        ExceptionHandling.report(ex);
-                        serverError(r);
-                        return;
-                    }
-                    if (resumeResult != SessionResumeTokenStore.ConsumeResult.VALID) {
-                        JSONObject resumeFailure = new JSONObject();
-                        resumeFailure.put("request_status", "unauthorized");
-                        resumeFailure.put("message", "The session resume token is invalid, expired, or has already been used.");
-                        sendResponse(r, 401, JSON.getString(resumeFailure), ContentType.JSON);
-                        return;
-                    }
-                    if (resumedSessionId != null) {
-                        for (ClientSession existing : new ArrayList<>(clientSessions)) {
-                            if (sessionMatchesApiKey(existing, apiKeys.getKey())
-                                    && resumedSessionId.equals(existing.getSession().getSessionId())) {
-                                invalidateSession(existing);
-                            }
-                        }
-                        invalidateResumeTokens(apiKeys.getKey(), resumedSessionId);
-                    }
-                }
-
-                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
-
-                ClientSession clientSession = null;
-                RemoteClient client = null;
-
-                if (clientIndex < 0 && !isPublicApi) {
-
-                    if(isEncrypted() && headers.contains("X-Api-Session-Id") && !isSessionInitOrResumeResource(resource)) {
-                        log.write("Session not found for API key; client must reinitialize the encrypted session.");
-                        unauthorized(r);
-                        return;
-                    }
-
-                    try {
-
-                        clientSession = appendNewClient(apiKeys, new ClientInfo(
-                                headers, ipAddr, hostname
-                        ));
-
-                        client = clientSession.getClient();
-                        clients.add(client);
-                        clientSessions.add(clientSession);
-                        newSessionForClient(client, clientSession);
-                        apiKeys = clientSession.getSession().getApiKeys();
-
-
-                        if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            // Reject only this newly-created session. A bad or
-                            // stale reconnect root must not destroy the API
-                            // credential needed for a recovery attempt.
-                            invalidateSession(clientSession);
-                            log.write("API Authorization failed to validate.");
-                            unauthorized(r);
-                            return;
-                        }
-
-                        if (!sessionAllowed(clientSession, apiKeys.getKey())) {
-                            log.write("API Authorization failed to validate.");
-                            invalidateSession(clientSession);
-                            sendControlResponse(r, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
-                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
-                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
-                            return;
-                        }
-
-                    } catch (APIException e) {
-                        log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                        serverError(r);
-                        return;
-                    } catch (Exception e) {
-                        log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                        serverError(r);
-                        return;
-                    }
-
-                } else if(!isPublicApi) {
-
-                    client = clients.get(clientIndex);
-
-                    if(isEncrypted() && isSessionInitOrResumeResource(resource)) {
-
-                        try {
-                            clientSession = appendNewSession(client, apiKeys, new ClientInfo(
-                                    headers, ipAddr, hostname
-                            ));
-                        } catch (APIException e) {
-                            log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                            serverError(r);
-                            return;
-                        }
-                        clientSessions.add(clientSession);
-                        newSessionForClient(client, clientSession);
-                        apiKeys = clientSession.getSession().getApiKeys();
-
-                        if (!verifyApiAuthorization(headers, apiKeys, clientSession, true)) {
-                            // Reject only this newly-created session. A bad or
-                            // stale reconnect root must not destroy the API
-                            // credential needed for a recovery attempt.
-                            invalidateSession(clientSession);
-                            log.write("API Authorization failed to validate.");
-                            unauthorized(r);
-                            return;
-                        }
-
-                        if (!sessionAllowed(clientSession, apiKeys.getKey())) {
-                            log.write("API Authorization failed to validate.");
-                            invalidateSession(clientSession);
-                            sendControlResponse(r, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
-                                    activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
-                                    sessionIpAddressesForApiKey(apiKeys.getKey())));
-                            return;
-                        }
-
-                    } else {
-
-                        int clientSessionIndex = -1;
-
-                        if (headers.contains("X-Api-Session-Id")) {
-
-                            clientSessionIndex = findClientSession(client, headers.getString("X-Api-Session-Id"));
-
-                        } else {
-
-                            clientSessionIndex = findClientSession(client, apiKeys);
-
-                        }
-
-                        if (clientSessionIndex < 0) {
-                            log.write("Invalid session information present in request.");
-                            if(headers.contains("X-Api-Session-Id")) lockApiKeyMaterial(apiKeys, "Invalid session identifier.");
-                            unauthorized(r);
-                            return;
-                        } else {
-                            clientSession = clientSessions.get(clientSessionIndex);
-                        }
-
-                        apiKeys = clientSession.getSession().getApiKeys();
-
-                        if (!verifyApiAuthorization(headers, apiKeys, clientSession, false)) {
-                            log.write("API Authorization failed to validate.");
-                            lockSessionApiKey(clientSession, "API authorization failed to validate.");
-                            unauthorized(r);
-                            return;
-                        }
-
-                        if (!sessionAllowed(clientSession, apiKeys.getKey())) {
-                            log.write("API Authorization failed to validate.");
-                            invalidateSession(clientSession);
-                            unauthorized(r);
-                            return;
-                        }
-
-                    }
-
-                }
-
-                if (!isPublicApi && clientSession.getClient().observeRequestMetadata(headers, hostname)) {
-                    log.write("Client request metadata changed for API key '" + clientSession.getClient().getApiKey() + "'.");
-                }
-
-                if(!isPublicApi) clientSession.newRequest();
-                if(!isPublicApi) newRequestForSession(clientSession);
-
-                BodyParameters parameters = null;
-                boolean requestIsEncrypted = isEncryptedTransfer(headers);
-                byte[] requestAad = null;
-                boolean isSessionInitResource = isSessionBootstrapResource(resource);
-
-                if (isEncrypted() && !isJsonContentType(headers)) {
-                    log.write("Encrypted requests require JSON Content-Type.");
-                    unauthorized(r);
-                    return;
-                }
-
-                if (isEncrypted() && !isSessionInitResource) {
-                    if (!requestIsEncrypted) {
-                        log.write("Encrypted request missing encrypted transfer encoding.");
-                        unauthorized(r);
-                        return;
-                    }
-                    requestAad = buildRequestAad(headers, inboundRequestMethod, t.path(), clientSession, resourceMethod);
-                    if (requestAad == null || !verifyRequestSignature(headers, inboundRequestMethod, t.path(), reqBody, clientSession.getSession().getApiKeys(), clientSession, resourceMethod)) {
-                        log.write("Request signature failed to validate.");
-                        lockSessionApiKey(clientSession, "Request signature or sequence failed to validate.");
-                        unauthorized(r);
-                        return;
-                    }
-                    clientSession.getSession().setCurrentRequestAad(requestAad);
-                }
-
-                if (!isEncrypted() && requestMethod.equals("GET") && !isSessionInitResource) {
-                    parameters = getParameters(t.path(), ContentType.GET_URL, headers, clientSession, requestIsEncrypted, requestAad);
-                } else {
-                    if (headers.contains("Content-Type")) {
-
-                        switch (contentType(headers)) {
-                            case JSON:
-                                parameters = getParameters(reqBody, ContentType.JSON, headers, clientSession, requestIsEncrypted, requestAad);
-                                break;
-                            case URL_ENCODED:
-                                parameters = getParameters(reqBody, ContentType.URL_ENCODED, headers, clientSession, requestIsEncrypted, requestAad);
-                                break;
-                            case FORM_DATA:
-                                parameters = getParameters(reqBody, ContentType.FORM_DATA, headers, clientSession, requestIsEncrypted, requestAad);
-                                break;
-                            default:
-                                parameters = getParameters(reqBody, ContentType.TEXT, headers, clientSession, requestIsEncrypted, requestAad);
-                                break;
-                        }
-
-                    } else parameters = getParameters(reqBody, ContentType.TEXT, headers, clientSession, requestIsEncrypted, requestAad);
-
-                }
-
-                boolean shouldCheckParams = !isSessionResource && !isAsyncResponseResource(resource) && resolvedResource != null && !resolvedResource.getParameters().isEmpty();
-
-                if (shouldCheckParams) {
-                    if (parameters == null || !parameters.isValid()) {
-                        failRequest(r, "Invalid parameters.");
-                        return;
-                    }
-                    if (!parameters.checkAllPresent(resolvedResource.getParameters())) {
-                        failRequest(r, "Invalid parameters.");
-                        return;
-                    }
-                }
-
-                if (!isPublicApi) {
-                    if (client.inBlacklist()) {
-                        authFailure(r);
-                        return;
-                    }
-                }
-
-                if (!isPublicApi) {
-                    if(client.isLimited(config.getRequestsPerMinute())) {
-                        addToTimeout(clientSession, ApiService.BlacklistEntryType.API_KEY);
-                        rateLimited(r);
-                        return;
-                    }
-                    removeFromTimeout(clientSession);
-                }
-
-                APIResponse response = null;
-                APISession.State sessionStateBeforeResponse = isEncrypted() && clientSession != null && clientSession.getSession() != null
-                        ? clientSession.getSession().snapshot()
-                        : null;
-                APIKeys.State keyStateBeforeResponse = isEncrypted() && clientSession != null && clientSession.getSession() != null && clientSession.getSession().getApiKeys() != null
-                        ? clientSession.getSession().getApiKeys().snapshot()
-                        : null;
-
-                try {
-                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.path(), earlyResumeAuthorized);
-                } catch (Exception e) {
-                ExceptionHandling.report(e);
-                    log.write("Server Error: " + e.getMessage());
-                    serverError(r);
-                    return;
-                }
-
-                try {
-
-                    ResponseCode responseCode = response.getResponseCode();
-                    String responseBody = response.getResponse();
-                    ContentType contentType = response.getContentType();
-
-                    switch (responseCode) {
-
-                        case REQUEST_FAILED:
-                            failRequest(r, responseBody);
-                            break;
-                        case FORBIDDEN:
-                            authFailure(r);
-                            break;
-                        case TOO_MANY_REQUESTS:
-                            if(!sendResponse(r, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-                        case SESSION_LIMIT_REACHED:
-                            if(!sendResponse(r, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-                        case REQUEST_TIMEOUT:
-                            if(!sendResponse(r, 408, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-                        case REDIRECT_START:
-                        case REDIRECT_CONTINUE:
-                            if(!sendResponse(r, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-                        case UNAUTHORIZED:
-                            unauthorized(r);
-                            break;
-                        case SERVER_ERROR:
-                            if(!sendServerError(r, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-                        case SUCCESSFUL:
-                            if(!sendResponse(r, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
-                            break;
-
-                    }
-
-                    if (responseCode == ResponseCode.SUCCESSFUL && isSessionCloseResource(resource)) {
-                        invalidateSession(clientSession);
-                    }
-
-                } catch (Exception ex) {
-
-                    log.write("Server Error: " + ex.getMessage());
-                    ExceptionHandling.report(ex);
-                    serverError(r);
-
-                }
-
-            } catch (Exception e) {
-                log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                serverError(r);
-            }
-
+        /** Transport writers preserve commit/rollback semantics; dispatch owns authentication. */
+        private interface ResponseSink {
+            void fail(String reason);
+            void unauthorized();
+            void serverError();
+            void tooLarge();
+            void authFailure();
+            void rateLimited();
+            void control(APIResponse response);
+            void authenticatedError(ClientSession session, ResponseCode code, int status) throws Exception;
+            boolean send(int status, String body, ContentType type);
+            boolean send(int status, String body, ContentType type, ClientSession session);
+            boolean sendServerError(String body, ContentType type, ClientSession session);
         }
 
         @Override
-        public void handle(HttpExchange t) throws IOException {
-
+        public void handleRequest(HttpServerRequest request, HttpServerResponse response) throws IOException {
             try {
-                
-                final Headers headersObj = t.getRequestHeaders();
+                dispatch(convertHeaders(request.headers()), request.method(), request.clientAddress(),
+                        request.path(), request.path(), request::body, null, false, new ResponseSink() {
+                    @Override public void fail(String reason) { APIServerHandler.this.failRequest(response, reason); }
+                    @Override public void unauthorized() { APIServerHandler.this.unauthorized(response); }
+                    @Override public void serverError() { APIServerHandler.this.serverError(response); }
+                    @Override public void tooLarge() { APIServerHandler.this.tooLarge(response); }
+                    @Override public void authFailure() { APIServerHandler.this.authFailure(response); }
+                    @Override public void rateLimited() { APIServerHandler.this.rateLimited(response); }
+                    @Override public void control(APIResponse controlResponse) { APIServerHandler.this.sendControlResponse(response, controlResponse); }
+                    @Override public void authenticatedError(ClientSession session, ResponseCode code, int status) throws Exception { APIServerHandler.this.sendAuthenticatedError(response, session, code, status); }
+                    @Override public boolean send(int status, String body, ContentType type) { return APIServerHandler.this.sendResponse(response, status, body, type); }
+                    @Override public boolean send(int status, String body, ContentType type, ClientSession session) { return APIServerHandler.this.sendResponse(response, status, body, type, session); }
+                    @Override public boolean sendServerError(String body, ContentType type, ClientSession session) { return APIServerHandler.this.sendServerError(response, body, type, session); }
+                });
+            } catch (Exception error) {
+                log.write("Server Error: " + error.getMessage());
+                ExceptionHandling.report(error);
+                serverError(response);
+            }
+        }
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            try {
+                dispatch(copyHttpHeaders(exchange.getRequestHeaders()), exchange.getRequestMethod().toUpperCase(),
+                        httpExchangeClientAddress(exchange), exchange.getRequestURI().getPath(),
+                        exchange.getRequestURI().toString(), exchange::getRequestBody, peerIdentity(exchange),
+                        exchange instanceof WebSocketExchange socket && socket.binaryRequest != null, new ResponseSink() {
+                    @Override public void fail(String reason) { APIServerHandler.this.failRequest(exchange, reason); }
+                    @Override public void unauthorized() { APIServerHandler.this.unauthorized(exchange); }
+                    @Override public void serverError() { APIServerHandler.this.serverError(exchange); }
+                    @Override public void tooLarge() { APIServerHandler.this.tooLarge(exchange); }
+                    @Override public void authFailure() { APIServerHandler.this.authFailure(exchange); }
+                    @Override public void rateLimited() { APIServerHandler.this.rateLimited(exchange); }
+                    @Override public void control(APIResponse response) { APIServerHandler.this.sendControlResponse(exchange, response); }
+                    @Override public void authenticatedError(ClientSession session, ResponseCode code, int status) throws Exception { APIServerHandler.this.sendAuthenticatedError(exchange, session, code, status); }
+                    @Override public boolean send(int status, String body, ContentType type) { return APIServerHandler.this.sendResponse(exchange, status, body, type); }
+                    @Override public boolean send(int status, String body, ContentType type, ClientSession session) { return APIServerHandler.this.sendResponse(exchange, status, body, type, session); }
+                    @Override public boolean sendServerError(String body, ContentType type, ClientSession session) { return APIServerHandler.this.sendServerError(exchange, body, type, session); }
+                });
+            } catch (Exception error) {
+                log.write("Server Error: " + error.getMessage());
+                ExceptionHandling.report(error);
+                serverError(exchange);
+            }
+        }
+
+        private com.fortrow.jflux.websockets.server.TlsPeerIdentity peerIdentity(HttpExchange exchange) {
+            if (exchange instanceof WebSocketExchange socket) return socket.peerIdentity;
+            if (exchange instanceof com.sun.net.httpserver.HttpsExchange tls) {
+                try { tls.getSSLSession().getPeerCertificates(); }
+                catch (javax.net.ssl.SSLPeerUnverifiedException noClientIdentity) { return null; }
+                return com.fortrow.jflux.websockets.server.TlsPeerIdentity.fromVerifiedSession(tls.getSSLSession());
+            }
+            return null;
+        }
+
+        /** Single string/JSON pipeline shared by HTTP/1 and HTTP/3, including ratchet rollback. */
+        private void dispatch(Headers requestHeaders, String method, InetAddress address,
+                              String path, String querySource, java.util.function.Supplier<java.io.InputStream> requestBody,
+                              com.fortrow.jflux.websockets.server.TlsPeerIdentity peerIdentity,
+                              boolean binaryTransport, ResponseSink sink) throws IOException {
+            RequestHeaders headers = new RequestHeaders(requestHeaders);
+            String apiKey = headers.getString("X-Api-Key");
+            // No key lookup, session inspection, body decryption or ratchet mutation has occurred yet.
+            if (peerIdentityAuthorizer != null) {
+                try {
+                    if (headers.hasAnyDuplicate("X-Api-Key") || peerIdentity == null || apiKey == null
+                            || apiKey.isBlank() || !peerIdentityAuthorizer.test(apiKey, peerIdentity)) {
+                        sink.unauthorized();
+                        return;
+                    }
+                } catch (Exception denied) {
+                    ExceptionHandling.report(denied);
+                    sink.unauthorized();
+                    return;
+                }
+            }
+            if (isEncrypted()) {
+                var exchangeLock = encryptedExchangeLocks[Math.floorMod(apiKey == null ? 0 : apiKey.hashCode(), encryptedExchangeLocks.length)];
+                exchangeLock.lock();
+                try {
+                    if (apiKey != null) activeExchangeKeys.add(apiKey);
+                    try { dispatchAuthorized(requestHeaders, method, address, path, querySource, requestBody, binaryTransport, sink); }
+                    finally { if (apiKey != null) activeExchangeKeys.remove(apiKey); }
+                } finally { exchangeLock.unlock(); }
+            } else dispatchAuthorized(requestHeaders, method, address, path, querySource, requestBody, binaryTransport, sink);
+        }
+
+        private void dispatchAuthorized(Headers requestHeaders, String method, InetAddress address,
+                                        String path, String querySource, java.util.function.Supplier<java.io.InputStream> requestBody,
+                                        boolean binaryTransport, ResponseSink sink) throws IOException {
+            try {
+                final Headers headersObj = requestHeaders;
                 final RequestHeaders headers = new RequestHeaders(headersObj);
-                final String inboundRequestMethod = t.getRequestMethod().toUpperCase();
+                final String inboundRequestMethod = method;
 
-                String remoteAddr = t.getRemoteAddress().toString();
-                String[] ipParts = remoteAddr.split(":");
-                String leftSide = ipParts[0];
-                String[] leftParts = leftSide.split("/");
-                final String hostname = leftParts[0];
-                final String ipAddr = leftParts[1];
+                InetAddress inetAddress = address;
+                final String hostname = inetAddress.getHostName();
+                final String ipAddr = inetAddress.getHostAddress();
 
-                final String resource = resourceFromPath(t.getRequestURI().getPath());
+                final String resource = resourceFromPath(path);
 
                 if (!RequestParser.verifyResource(getApiResources(), isEncrypted() ? config.getEncryptedSessionPaths() : new String[]{}, config.getResponsePath(), resource)) {
                     log.write("Invalid resource '" + resource + "' requested.");
-                    failRequest(t, "Invalid resource.");
+                    sink.fail("Invalid resource.");
                     return;
                 }
 
@@ -1173,24 +1093,24 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if (inboundRequestMethod.equals("OPTIONS")) {
                     if (config.getCorsPolicy().isPermitted()) {
-                        sendResponse(t, 200, "", ContentType.TEXT);
+                        sink.send(200, "", ContentType.TEXT);
                         return;
                     } else {
                         log.write("Request blocked by CORS policy.");
-                        unauthorized(t);
+                        sink.unauthorized();
                         return;
                     }
                 }
 
                 if (!inboundRequestMethod.equals(requestMethod)) {
                     log.write("Invalid '" + requestMethod + "' request method used.");
-                    failRequest(t, "Invalid request method.");
+                    sink.fail("Invalid request method.");
                     return;
                 }
 
                 if (!checkRequestHeaders(headers, resource)) {
                     log.write("Invalid headers in request.");
-                    unauthorized(t);
+                    sink.unauthorized();
                     return;
                 }
 
@@ -1198,7 +1118,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         && (!isAfter(headers.getInstantFromTimestamp("X-Request-Timestamp"), 30) ||
                         !isBefore(headers.getInstantFromTimestamp("X-Request-Timestamp"), 30))
                 ) {
-                    unauthorized(t);
+                    sink.unauthorized();
                     log.write("Invalid timestamps in request headers.");
                     return;
                 }
@@ -1207,7 +1127,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 APIResource resolvedResource = resolveApiResource(resource, resourceMethod, isSessionResource, isResponseResource);
                 if(!isSessionResource && !isResponseResource && resolvedResource == null) {
                     log.write("Invalid resource method '" + resourceMethod + "' for resource '" + resource + "'.");
-                    failRequest(t, "Invalid resource method.");
+                    sink.fail("Invalid resource method.");
                     return;
                 }
 
@@ -1215,16 +1135,18 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if ((!isPublicApi && !headers.contains("X-Api-Key")) && !isSessionBootstrapResource(resource)) {
                     log.write("Missing 'X-Api-Key' header.");
-                    unauthorized(t);
+                    sink.unauthorized();
                     return;
                 }
 
                 final String reqBody;
                 try {
-                    reqBody = bodyFromStream(t.getRequestBody());
+                    reqBody = binaryTransport
+                            ? new String(requestBody.get().readAllBytes(), StandardCharsets.UTF_8)
+                            : bodyFromStream(requestBody.get());
                 } catch (RequestBodyTooLargeException ex) {
                     log.write("Rejected request body larger than configured maximum.");
-                    tooLarge(t);
+                    sink.tooLarge();
                     return;
                 }
 
@@ -1234,17 +1156,20 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if (!isPublicApi && apiKeys == null) {
                     log.write("API Keys in request could not be validated.");
-                    unauthorized(t);
+                    sink.unauthorized();
                     return;
                 }
 
                 if(!isPublicApi && !apiKeys.ipIsAllowed(ipAddr)) {
                     log.write("Unallowed IP address in request for API key: '" + apiKeys.getKey() + "'.");
-                    unauthorized(t);
+                    sink.unauthorized();
                     return;
                 }
 
-                invalidateOldSessions();
+                boolean earlyResumeAuthorized = false;
+                ClientSession clientSession = null;
+                RemoteClient client = null;
+                invalidateOldSessions(headers.getString("X-Api-Key"));
 
                 if (isSessionResetResource(resource) || isSessionAllocateResource(resource)) {
                     APIResponse controlResponse;
@@ -1254,14 +1179,13 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                                 : handleSessionAllocate(apiKeys, headers, reqBody);
                     } catch (APIException ex) {
                         ExceptionHandling.report(ex);
-                        serverError(t);
+                        sink.serverError();
                         return;
                     }
-                    sendControlResponse(t, controlResponse);
+                    sink.control(controlResponse);
                     return;
                 }
 
-                boolean earlyResumeAuthorized = false;
                 if (isSessionResumeResource(resource)) {
                     JSONObject resumeRequest = parseControlObject(reqBody);
                     String resumeToken = controlString(resumeRequest, "resume_token");
@@ -1269,45 +1193,46 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     earlyResumeAuthorized = resumedSessionId != null
                             && resumeTokenStore.isEarlyToken(apiKeys.getKey(), apiKeys.getSecret(), resumedSessionId, resumeToken);
                     if (!earlyResumeAuthorized && !rootSessionAuthorizationValid(headers, apiKeys)) {
-                        unauthorized(t);
+                        sink.unauthorized();
                         return;
                     }
                     SessionResumeTokenStore.ConsumeResult resumeResult;
                     try {
-                        resumeResult = resumeTokenStore.consume(apiKeys.getKey(), apiKeys.getSecret(), controlString(resumeRequest, "resume_token"));
+                        String requestedResumeToken = controlString(resumeRequest, "resume_token");
+                        resumeResult = resumedSessionId == null
+                                ? resumeTokenStore.consume(apiKeys.getKey(), apiKeys.getSecret(), requestedResumeToken)
+                                : resumeTokenStore.consumeAndInvalidateForSession(
+                                        apiKeys.getKey(), apiKeys.getSecret(), requestedResumeToken, resumedSessionId);
                     } catch (APIException ex) {
                         ExceptionHandling.report(ex);
-                        serverError(t);
+                        sink.serverError();
                         return;
                     }
                     if (resumeResult != SessionResumeTokenStore.ConsumeResult.VALID) {
                         JSONObject resumeFailure = new JSONObject();
                         resumeFailure.put("request_status", "unauthorized");
                         resumeFailure.put("message", "The session resume token is invalid, expired, or has already been used.");
-                        sendResponse(t, 401, JSON.getString(resumeFailure), ContentType.JSON);
+                        sink.send(401, JSON.getString(resumeFailure), ContentType.JSON);
                         return;
                     }
                     if (resumedSessionId != null) {
-                        for (ClientSession existing : new ArrayList<>(clientSessions)) {
+                        for (ClientSession existing : getClientSessions()) {
                             if (sessionMatchesApiKey(existing, apiKeys.getKey())
                                     && resumedSessionId.equals(existing.getSession().getSessionId())) {
                                 invalidateSession(existing);
                             }
                         }
-                        invalidateResumeTokens(apiKeys.getKey(), resumedSessionId);
                     }
                 }
 
-                int clientIndex = (config.isPublicApi()) ? -1 : findClient(apiKeys);
+                RemoteClient existingClient = config.isPublicApi() ? null : findClient(apiKeys);
 
-                ClientSession clientSession = null;
-                RemoteClient client = null;
 
-                if (clientIndex < 0 && !isPublicApi) {
+                if (existingClient == null && !isPublicApi) {
 
                     if(isEncrypted() && headers.contains("X-Api-Session-Id") && !isSessionInitOrResumeResource(resource)) {
                         log.write("Session not found for API key; client must reinitialize the encrypted session.");
-                        unauthorized(t);
+                        sink.unauthorized();
                         return;
                     }
 
@@ -1318,8 +1243,10 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         ));
 
                         client = clientSession.getClient();
-                        clients.add(client);
-                        clientSessions.add(clientSession);
+                        synchronized (sessionStateLock) {
+                            clients.add(client);
+                            clientSessions.add(clientSession);
+                        }
                         newSessionForClient(client, clientSession);
                         apiKeys = clientSession.getSession().getApiKeys();
 
@@ -1330,14 +1257,14 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             // credential needed for a recovery attempt.
                             invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
-                            unauthorized(t);
+                            sink.unauthorized();
                             return;
                         }
 
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            sendControlResponse(t, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                            sink.control(APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
                                     activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
                                     sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
@@ -1345,19 +1272,19 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                     } catch (APIException e) {
                         log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                        serverError(t);
+                        ExceptionHandling.report(e);
+                        sink.serverError();
                         return;
                     } catch (Exception e) {
                         log.write("Server Error: " + e.getMessage());
-                ExceptionHandling.report(e);
-                        serverError(t);
+                        ExceptionHandling.report(e);
+                        sink.serverError();
                         return;
                     }
 
                 } else if(!isPublicApi) {
 
-                    client = clients.get(clientIndex);
+                    client = existingClient;
 
                     if(isEncrypted() && isSessionInitOrResumeResource(resource)) {
 
@@ -1367,11 +1294,11 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             ));
                         } catch (APIException e) {
                             log.write("Server Error: " + e.getMessage());
-            ExceptionHandling.report(e);
-                            serverError(t);
+                            ExceptionHandling.report(e);
+                            sink.serverError();
                             return;
                         }
-                        clientSessions.add(clientSession);
+                        synchronized (sessionStateLock) { clientSessions.add(clientSession); }
                         newSessionForClient(client, clientSession);
                         apiKeys = clientSession.getSession().getApiKeys();
 
@@ -1381,14 +1308,14 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             // credential needed for a recovery attempt.
                             invalidateSession(clientSession);
                             log.write("API Authorization failed to validate.");
-                            unauthorized(t);
+                            sink.unauthorized();
                             return;
                         }
 
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            sendControlResponse(t, APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
+                            sink.control(APIResponse.sessionLimitReached(null, sessionCapacity.limitFor(apiKeys.getKey()),
                                     activeSessionsForApiKey(apiKeys.getKey()), resumeTokenStore.outstandingForApiKey(apiKeys.getKey()),
                                     sessionIpAddressesForApiKey(apiKeys.getKey())));
                             return;
@@ -1396,25 +1323,25 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                     } else {
 
-                        int clientSessionIndex = -1;
+                        ClientSession existingSession = null;
 
                         if (headers.contains("X-Api-Session-Id")) {
 
-                            clientSessionIndex = findClientSession(client, headers.getString("X-Api-Session-Id"));
+                            existingSession = findClientSession(client, headers.getString("X-Api-Session-Id"));
 
                         } else {
 
-                            clientSessionIndex = findClientSession(client, apiKeys);
+                            existingSession = findClientSession(client, apiKeys);
 
                         }
 
-                        if (clientSessionIndex < 0) {
+                        if (existingSession == null) {
                             log.write("Invalid session information present in request.");
                             if(headers.contains("X-Api-Session-Id")) lockApiKeyMaterial(apiKeys, "Invalid session identifier.");
-                            unauthorized(t);
+                            sink.unauthorized();
                             return;
                         } else {
-                            clientSession = clientSessions.get(clientSessionIndex);
+                            clientSession = existingSession;
                         }
 
                         apiKeys = clientSession.getSession().getApiKeys();
@@ -1422,20 +1349,21 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         if (!verifyApiAuthorization(headers, apiKeys, clientSession, false)) {
                             log.write("API Authorization failed to validate.");
                             lockSessionApiKey(clientSession, "API authorization failed to validate.");
-                            unauthorized(t);
+                            sink.unauthorized();
                             return;
                         }
 
                         if (!sessionAllowed(clientSession, apiKeys.getKey())) {
                             log.write("API Authorization failed to validate.");
                             invalidateSession(clientSession);
-                            unauthorized(t);
+                            sink.unauthorized();
                             return;
                         }
 
                     }
 
                 }
+
 
                 if (!isPublicApi && clientSession.getClient().observeRequestMetadata(headers, hostname)) {
                     log.write("Client request metadata changed for API key '" + clientSession.getClient().getApiKey() + "'.");
@@ -1449,30 +1377,33 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 byte[] requestAad = null;
                 boolean isSessionInitResource = isSessionBootstrapResource(resource);
 
-                if (isEncrypted() && !isJsonContentType(headers)) {
+                boolean binaryContent = "application/octet-stream".equalsIgnoreCase(headers.getString("Content-Type"));
+                if (isEncrypted() && (binaryTransport ? !binaryContent : !isJsonContentType(headers))) {
                     log.write("Encrypted requests require JSON Content-Type.");
-                    unauthorized(t);
+                    sink.unauthorized();
                     return;
                 }
 
                 if (isEncrypted() && !isSessionInitResource) {
                     if (!requestIsEncrypted) {
                         log.write("Encrypted request missing encrypted transfer encoding.");
-                        unauthorized(t);
+                        sink.unauthorized();
                         return;
                     }
-                    requestAad = buildRequestAad(headers, inboundRequestMethod, t.getRequestURI().getPath(), clientSession, resourceMethod);
-                    if (requestAad == null || !verifyRequestSignature(headers, inboundRequestMethod, t.getRequestURI().getPath(), reqBody, clientSession.getSession().getApiKeys(), clientSession, resourceMethod)) {
+                    requestAad = buildRequestAad(headers, inboundRequestMethod, path, clientSession, resourceMethod);
+                    if (requestAad == null || !verifyRequestSignature(headers, inboundRequestMethod, path, reqBody, clientSession.getSession().getApiKeys(), clientSession, resourceMethod)) {
                         log.write("Request signature failed to validate.");
                         lockSessionApiKey(clientSession, "Request signature or sequence failed to validate.");
-                        unauthorized(t);
+                        sink.unauthorized();
                         return;
                     }
                     clientSession.getSession().setCurrentRequestAad(requestAad);
                 }
 
-                if (!isEncrypted() && requestMethod.equals("GET") && !isSessionInitResource) {
-                    parameters = getParameters(t.getRequestURI(), ContentType.GET_URL, headers, clientSession, requestIsEncrypted, requestAad);
+                if (binaryTransport) {
+                    parameters = getParameters(reqBody, ContentType.BINARY, headers, clientSession, requestIsEncrypted, requestAad);
+                } else if (!isEncrypted() && requestMethod.equals("GET") && !isSessionInitResource) {
+                    parameters = getParameters(querySource, ContentType.GET_URL, headers, clientSession, requestIsEncrypted, requestAad);
                 } else {
                     if (headers.contains("Content-Type")) {
 
@@ -1499,18 +1430,21 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if (shouldCheckParams) {
                     if (parameters == null || !parameters.isValid()) {
-                        failRequest(t, "Invalid parameters.");
+                        if (isEncrypted()) sink.authenticatedError(clientSession, ResponseCode.REQUEST_FAILED, 400);
+                        else sink.fail("Invalid parameters.");
                         return;
                     }
                     if (!parameters.checkAllPresent(resolvedResource.getParameters())) {
-                        failRequest(t, "Invalid parameters.");
+                        if (isEncrypted()) sink.authenticatedError(clientSession, ResponseCode.REQUEST_FAILED, 400);
+                        else sink.fail("Invalid parameters.");
                         return;
                     }
                 }
 
                 if (!isPublicApi) {
                     if (client.inBlacklist()) {
-                        authFailure(t);
+                        if (isEncrypted()) sink.authenticatedError(clientSession, ResponseCode.FORBIDDEN, 403);
+                        else sink.authFailure();
                         return;
                     }
                 }
@@ -1518,7 +1452,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 if (!isPublicApi) {
                     if(client.isLimited(config.getRequestsPerMinute())) {
                         addToTimeout(clientSession, ApiService.BlacklistEntryType.API_KEY);
-                        rateLimited(t);
+                        if (isEncrypted()) sink.authenticatedError(clientSession, ResponseCode.TOO_MANY_REQUESTS, 429);
+                        else sink.rateLimited();
                         return;
                     }
                     removeFromTimeout(clientSession);
@@ -1533,11 +1468,11 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         : null;
 
                 try {
-                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, t.getRequestURI().getPath(), earlyResumeAuthorized);
+                    response = processRequest(headers, clientSession, resource, resourceMethod, parameters, path, earlyResumeAuthorized);
                 } catch (Exception e) {
-            ExceptionHandling.report(e);
+                    ExceptionHandling.report(e);
                     log.write("Server Error: " + e.getMessage());
-                    serverError(t);
+                    sink.serverError();
                     return;
                 }
 
@@ -1550,32 +1485,32 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     switch (responseCode) {
 
                         case REQUEST_FAILED:
-                            failRequest(t, responseBody);
+                            if(!sink.send(400, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case FORBIDDEN:
-                            authFailure(t);
+                            if(!sink.send(403, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case TOO_MANY_REQUESTS:
-                            if(!sendResponse(t, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.send(429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case SESSION_LIMIT_REACHED:
-                            if(!sendResponse(t, 429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.send(429, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case REQUEST_TIMEOUT:
-                            if(!sendResponse(t, 408, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.send(408, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case REDIRECT_START:
                         case REDIRECT_CONTINUE:
-                            if(!sendResponse(t, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.send(200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case UNAUTHORIZED:
-                            unauthorized(t);
+                            sink.unauthorized();
                             break;
                         case SERVER_ERROR:
-                            if(!sendServerError(t, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.sendServerError(responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
                         case SUCCESSFUL:
-                            if(!sendResponse(t, 200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
+                            if(!sink.send(200, responseBody, contentType, clientSession)) rollbackEncryptedRequest(clientSession, sessionStateBeforeResponse, keyStateBeforeResponse);
                             break;
 
                     }
@@ -1588,26 +1523,31 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                     log.write("Server Error: " + ex.getMessage());
                     ExceptionHandling.report(ex);
-                    serverError(t);
+                    sink.serverError();
 
                 }
 
             } catch (Exception e) {
                 log.write("Server Error: " + e.getMessage());
                 ExceptionHandling.report(e);
-                serverError(t);
+                sink.serverError();
             }
 
         }
 
-        private void invalidateOldSessions() {
-            for(int i=clientSessions.size() - 1; i>=0; i--) {
-                if(clientSessions.get(i).getSession().invalidateByTime()) {
-                    clientSessions.get(i).getSession().deactivate();
-                    sessionInvalidated(clientSessions.get(i));
-                    pastSessions.add(clientSessions.get(i).getSession());
-                    clientSessions.remove(i);
+        private void invalidateOldSessions(String currentKey) {
+            synchronized (sessionStateLock) {
+                for(int i=clientSessions.size() - 1; i>=0; i--) {
+                    String key = sessionApiKey(clientSessions.get(i));
+                    if (key != null && activeExchangeKeys.contains(key) && !SecureCompare.equals(key, currentKey)) continue;
+                    if(clientSessions.get(i).getSession().invalidateByTime()) {
+                        clientSessions.get(i).getSession().deactivate();
+                        sessionInvalidated(clientSessions.get(i));
+                        pastSessions.add(clientSessions.get(i).getSession());
+                        clientSessions.remove(i);
+                    }
                 }
+
             }
         }
 
@@ -1621,6 +1561,24 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 }
             }
             return headers;
+        }
+
+        private Headers copyHttpHeaders(Headers source) {
+            Headers copy = new Headers();
+            if (source == null) return copy;
+            for (Map.Entry<String, List<String>> entry : source.entrySet()) {
+                if (entry.getKey() == null || WEBSOCKET_REMOTE_ADDRESS_HEADER.equalsIgnoreCase(entry.getKey())
+                        || WEBSOCKET_BRIDGE_TOKEN_HEADER.equalsIgnoreCase(entry.getKey())) continue;
+                List<String> values = entry.getValue();
+                if (values == null) continue;
+                for (String value : values) if (value != null) copy.add(entry.getKey(), value);
+            }
+            return copy;
+        }
+
+        private InetAddress httpExchangeClientAddress(HttpExchange exchange) {
+            InetAddress direct = exchange.getRemoteAddress() == null ? null : exchange.getRemoteAddress().getAddress();
+            return direct == null ? InetAddress.getLoopbackAddress() : direct;
         }
 
 
@@ -1794,7 +1752,8 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
         private void invalidateSessionsByLimitUsingIp(RemoteClient client) {
-            int count = 0;
+            synchronized (sessionStateLock) {
+                int count = 0;
             for(int i=clientSessions.size() - 1; i>=0; i--) {
                 if(__.same(client.getClientInfo().getRemoteIp(), clientSessions.get(i).getClient().getClientInfo().getRemoteIp())) {
                     count++;
@@ -1804,6 +1763,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         clientSessions.remove(i);
                     }
                 }
+            }
             }
         }
 
@@ -1933,80 +1893,95 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
         private boolean sessionAllowed(ClientSession client, String apiKey) {
-            if (apiKey == null || apiKey.isBlank()) return false;
-            java.util.Set<String> live = new java.util.HashSet<>();
-            for (ClientSession current : clientSessions) {
-                if (sessionMatchesApiKey(current, apiKey)) live.add(current.getSession().getSessionId());
-            }
-            return activeSessionsForApiKey(apiKey) + resumeTokenStore.outstandingForApiKey(apiKey, live)
-                    <= sessionCapacity.limitFor(apiKey);
+            synchronized (sessionStateLock) {
+                if (apiKey == null || apiKey.isBlank()) return false;
+                java.util.Set<String> live = new java.util.HashSet<>();
+                for (ClientSession current : clientSessions) {
+                    if (sessionMatchesApiKey(current, apiKey)) live.add(current.getSession().getSessionId());
+                }
+                return activeSessionsForApiKey(apiKey) + resumeTokenStore.outstandingForApiKey(apiKey, live)
+                        <= sessionCapacity.limitFor(apiKey);
 
+
+            }
         }
 
         private int getNumSessions(RemoteClient client) {
+            synchronized (sessionStateLock) {
 
-            int numSessions = 0;
+                int numSessions = 0;
 
-            for(int i=0; i<clientSessions.size(); i++) {
+                for(int i=0; i<clientSessions.size(); i++) {
 
-                RemoteClient current = clientSessions.get(i).getClient();
-                if(current.equals(client))
-                    numSessions++;
-
-            }
-
-            return numSessions;
-
-        }
-
-        private int findClientSession(RemoteClient client, String sessionId) {
-
-            for(int i=0; i<clientSessions.size(); i++) {
-
-                RemoteClient current = clientSessions.get(i).getClient();
-
-                if(current.guessSame(client)) {
-
-                    if(clientSessions.get(i).getSession().getSessionId().equals(sessionId))
-                        return i;
+                    RemoteClient current = clientSessions.get(i).getClient();
+                    if(current.equals(client))
+                        numSessions++;
 
                 }
 
+                return numSessions;
+
+
             }
-
-            return -1;
-
         }
 
-        private int findClientSession(RemoteClient client, APIKeys apiKeys) {
+        private ClientSession findClientSession(RemoteClient client, String sessionId) {
+            synchronized (sessionStateLock) {
 
-            for(int i=0; i<clientSessions.size(); i++) {
+                for(int i=0; i<clientSessions.size(); i++) {
 
-                RemoteClient current = clientSessions.get(i).getClient();
+                    RemoteClient current = clientSessions.get(i).getClient();
 
-                if(current.equals(client)) {
+                    if(current.guessSame(client)) {
 
-                    if(clientSessions.get(i).getSession().getApiKeys().getKey().equals(apiKeys.getKey()))
-                        return i;
+                        if(clientSessions.get(i).getSession().getSessionId().equals(sessionId))
+                            return clientSessions.get(i);
+
+                    }
 
                 }
 
+                return null;
+
+
             }
-
-            return -1;
-
         }
 
-        private int findClient(APIKeys apiKeys) {
+        private ClientSession findClientSession(RemoteClient client, APIKeys apiKeys) {
+            synchronized (sessionStateLock) {
 
-            for(int i=0; i<clients.size(); i++) {
-                RemoteClient curr = clients.get(i);
-                if(curr.equals(apiKeys))
-                    return i;
+                for(int i=0; i<clientSessions.size(); i++) {
+
+                    RemoteClient current = clientSessions.get(i).getClient();
+
+                    if(current.equals(client)) {
+
+                        if(clientSessions.get(i).getSession().getApiKeys().getKey().equals(apiKeys.getKey()))
+                            return clientSessions.get(i);
+
+                    }
+
+                }
+
+                return null;
+
+
             }
+        }
 
-            return -1;
+        private RemoteClient findClient(APIKeys apiKeys) {
+            synchronized (sessionStateLock) {
 
+                for(int i=0; i<clients.size(); i++) {
+                    RemoteClient curr = clients.get(i);
+                    if(curr.equals(apiKeys))
+                        return curr;
+                }
+
+                return null;
+
+
+            }
         }
 
         private boolean checkRequestHeaders(RequestHeaders headers, String resource) {
@@ -2139,10 +2114,12 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if(!headers.getString("X-Api-Key-Set-Id").equals(clientSession.getSession().getKeySetId())) {
                     lockSessionApiKey(clientSession, "Invalid API key-set id.");
-                    return new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    return new APIResponse(clientSession, ResponseCode.UNAUTHORIZED);
                 }
                 if (params == null || !params.isValid() || !params.checkAllPresent(resource == null ? List.of() : resource.getParameters())) {
-                    return new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    APIResponse failure = new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    failure.encrypt();
+                    return failure;
                 }
 
                 if(config.isAsync() && resource.isAsync()) {
@@ -2244,10 +2221,12 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 if (!headers.getString("X-Api-Key-Set-Id").equals(clientSession.getSession().getKeySetId())) {
                     lockSessionApiKey(clientSession, "Invalid API key-set id.");
-                    return new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    return new APIResponse(clientSession, ResponseCode.UNAUTHORIZED);
                 }
                 if (params == null || !params.isValid() || !params.checkAllPresent(resource == null ? List.of() : resource.getParameters())) {
-                    return new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    APIResponse failure = new APIResponse(clientSession, ResponseCode.REQUEST_FAILED);
+                    failure.encrypt();
+                    return failure;
                 }
 
                 APIResponse resp = execute(resource, inboundRequest);
@@ -2294,6 +2273,18 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             obj.put("client_private_key", clientPrivateKey);
             obj.put("key_set_id", keySetId);
             obj.put("request_status", "success");
+
+            if (config.isActiveSessionRecoveryEnabled()) {
+                APIKeys keys = clientSession.getSession().getApiKeys();
+                try {
+                    obj.put("resume_token", resumeTokenStore.issueWhileActive(
+                            keys.getKey(), keys.getSecret(), sessionId,
+                            java.time.Duration.ofMinutes(config.getResumeTokenMinutes())));
+                    obj.put("resume_expires_at_ms", System.currentTimeMillis() + config.getResumeTokenMinutes() * 60_000L);
+                } catch (APIException error) {
+                    if (log != null) log.write("Could not issue an early resume token during session initialization.");
+                }
+            }
 
             clientSession.getSession().keysTransferred();
 
@@ -2345,10 +2336,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 }
                 APIResponse response = new APIResponse(clientSession, obj, ResponseCode.SUCCESSFUL);
                 response.encrypt();
-                // The encrypted response must be prepared while the session
-                // keys are still available, but an authorized close must no
-                // longer count against the API key's active-session limit.
-                invalidateSession(clientSession);
+                // The outer request handler invalidates the session after the
+                // encrypted response is written. Clearing key material here
+                // would make the close response impossible to authenticate.
                 return response;
             }
 
@@ -2441,6 +2431,12 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return sendResponse(t, 500, responseBody, contentType == null ? ContentType.JSON : contentType, clientSession);
         }
 
+        private void sendAuthenticatedError(HttpExchange t, ClientSession clientSession, ResponseCode code, int status) throws Exception {
+            APIResponse response = new APIResponse(clientSession, code);
+            response.encrypt();
+            sendResponse(t, status, response.getResponse(), ContentType.JSON, clientSession);
+        }
+
         private void unauthorized(HttpExchange t) {
 
             String retVal = "{\"request_status\":\"unauthorized\"}";
@@ -2511,6 +2507,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 String contentTypeStr = "";
 
                 switch (contentType) {
+                    case BINARY:
+                        contentTypeStr = "application/octet-stream";
+                        break;
                     case JSON:
                         contentTypeStr = "application/json";
                         break;
@@ -2613,6 +2612,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 String contentTypeStr = "";
 
                 switch (contentType) {
+                    case BINARY:
+                        contentTypeStr = "application/octet-stream";
+                        break;
                     case JSON:
                         contentTypeStr = "application/json";
                         break;
@@ -2664,6 +2666,12 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 return false;
             }
             return sendResponse(t, 500, responseBody, contentType == null ? ContentType.JSON : contentType, clientSession);
+        }
+
+        private void sendAuthenticatedError(HttpServerResponse t, ClientSession clientSession, ResponseCode code, int status) throws Exception {
+            APIResponse response = new APIResponse(clientSession, code);
+            response.encrypt();
+            sendResponse(t, status, response.getResponse(), ContentType.JSON, clientSession);
         }
 
         private void unauthorized(HttpServerResponse t) {
@@ -2740,6 +2748,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 String contentTypeStr = "";
 
                 switch (contentType) {
+                    case BINARY:
+                        contentTypeStr = "application/octet-stream";
+                        break;
                     case JSON:
                         contentTypeStr = "application/json";
                         break;
@@ -2846,6 +2857,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                 String contentTypeStr = "";
 
                 switch (contentType) {
+                    case BINARY:
+                        contentTypeStr = "application/octet-stream";
+                        break;
                     case JSON:
                         contentTypeStr = "application/json";
                         break;

@@ -57,6 +57,8 @@ public class InboundRequest {
         return params == null ? "" : params.text();
     }
 
+    public byte[] getBodyBytes() { return params == null ? new byte[0] : params.bytes(); }
+
     public String body() {
         return getBody();
     }
