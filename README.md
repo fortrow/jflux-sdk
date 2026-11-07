@@ -254,6 +254,8 @@ Keep source headers consistent with the licensing files and preserve third-party
 copyright and license notices. Local maintenance scripts are not distributed
 with this repository.
 
+See the [package documentation](docs/) for API details and configuration guides.
+
 Keep changes focused, include relevant tests, and update public usage information
 alongside API changes. Use JFlux's exception types for new failure paths. Report
 bugs through the repository's issue tracker with your Java version, OS, a minimal

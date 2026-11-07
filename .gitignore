@@ -64,9 +64,9 @@ build/
 hs_err_pid*
 replay_pid*
 
-# Local documentation and AI instruction/working Markdown (at any depth)
+# Local maintenance scripts and AI instruction/working Markdown (at any depth)
 /scripts/
-docs/
+# Keep agent instructions and implementation runbooks local.
 AGENTS.md
 AGENTS.local.md
 IMPLEMENT.md
