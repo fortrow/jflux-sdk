@@ -39,7 +39,7 @@ The standard references are [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final
 
 ## Provider and jar-size behavior
 
-The PQC implementations use the Bouncy Castle lightweight API version `1.85.2`.
+The PQC implementations use the Bouncy Castle lightweight API version `1.86`.
 The Maven dependency is optional so core consumers that do not use PQC do not receive
 the roughly 10 MB provider jar transitively. `CryptographyRegister.fromDefaults()`
 registers PQC algorithms only when the provider classes are available.
@@ -50,17 +50,41 @@ Applications using the core jar on Java 23 or earlier must add:
 <dependency>
   <groupId>org.bouncycastle</groupId>
   <artifactId>bcprov-jdk18on</artifactId>
-  <version>1.85.2</version>
+  <version>1.86</version>
 </dependency>
 ```
 
-The full shaded jflux artifact includes the optional provider. The core, database, and
-HTTP split artifacts intentionally do not include it yet; this keeps ordinary runtime
+The full and HTTP shaded jflux artifacts include the optional provider. The core and database
+split artifacts intentionally do not include it; this keeps ordinary runtime
 images small and lets a later packaging milestone provide a dedicated PQC classifier.
 
 The regular Bouncy Castle provider should not be described as a FIPS 140 validated
 cryptographic module. A regulated deployment must supply and configure its validated
 provider, then register compatible adapter implementations at application startup.
+
+## Authenticated KEM envelopes (1.2.0)
+
+`KemEnvelope.seal(algorithm, publicKey, plaintext, context)` and
+`KemEnvelope.open(algorithm, privateKey, envelope, context)` combine the registered
+ML-KEM adapter with HKDF-SHA256 and AES-256-GCM. Supported names are `ml-kem-512`,
+`ml-kem-768`, and `ml-kem-1024`. The context is authenticated and must match on both
+sides. These envelopes accept at most 4096 plaintext bytes and are intended for
+key material, not large application payloads.
+
+The binary format is version byte `1`, the parameter-set-sized KEM encapsulation,
+a 12-byte random nonce, and AES-GCM ciphertext with its 16-byte tag. HKDF uses the
+encapsulation as salt and `JFlux-KEM-Envelope-v1/<algorithm>` as derivation context.
+Malformed lengths, unsupported versions, wrong keys, and modified data fail
+authentication. Temporary shared secrets and derived AES keys are erased in
+`finally` blocks. `EncapsulatedSecret` now implements `AutoCloseable`; use
+try-with-resources to erase its retained secret after derivation. Java/provider
+copies remain subject to JVM memory management.
+
+`Cryptography.deriveKey(...)` also clears its intermediate HKDF buffers when
+derivation completes or fails.
+
+The encrypted API uses this envelope through `EncryptedApiCryptoSuite`, retaining
+its PSK and HMAC authentication. See [HTTP configuration](http.md).
 
 ## Selecting and replacing algorithms
 
@@ -109,3 +133,13 @@ applications should register a real operation or use one of the built-in adapter
 
 Key arrays and encapsulation results are copied at adapter boundaries. This makes
 ownership explicit and prevents provider-owned buffers from being retained by callers.
+
+## Bouncy Castle 1.86 compatibility
+
+JFlux 1.2.1 now pins Bouncy Castle 1.86. Its ML-KEM, ML-DSA and SLH-DSA
+adapters and availability checks use the provider's `org.bouncycastle.crypto`
+packages (params, generators, kems and signers). Do not mix the old 1.85 PQC
+classes from a fat development JAR with a 1.86 runtime. Qualify shaded
+artifacts in a clean JVM as well as testing the Maven classpath. The encrypted
+API suite identifiers and wire protocol are unchanged; unavailable suites still
+fail rather than falling back.

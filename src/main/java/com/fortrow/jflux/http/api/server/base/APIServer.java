@@ -1,23 +1,26 @@
 /*
- * -------------------------------------------------------------------------
+ * Copyright (c) 2026 Fortrow LLC.
  *
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
  *
- * NOTICE: All information contained herein is, and remains the property of
- * Fortrow, LLC. The intellectual and technical concepts contained herein are
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents,
- * patents in process, and are protected by trade secret or copyright law.
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
  *
- * Dissemination of this information or reproduction of this material is
- * strictly forbidden unless prior written permission is obtained from
- * Fortrow, LLC.
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
  *
- * -------------------------------------------------------------------------
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
  *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-10 22:53:45 EDT
- *
- * -------------------------------------------------------------------------
-
  */
 package com.fortrow.jflux.http.api.server.base;
 
@@ -30,6 +33,7 @@ import com.fortrow.jflux.http.api.base.prereqs.ApiService;
 import com.fortrow.jflux.http.api.server.config.APIServerConfig;
 import com.fortrow.jflux.http.api.server.containers.*;
 import com.fortrow.jflux.http.api.server.encryption.APIKeys;
+import com.fortrow.jflux.http.api.server.encryption.EncryptedApiCryptoSuite;
 import com.fortrow.jflux.http.api.server.exceptions.APIException;
 import com.fortrow.jflux.http.api.server.impl.APIEvents;
 import com.fortrow.jflux.http.api.server.impl.ClientFilter;
@@ -86,6 +90,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
     private static final String WEBSOCKET_BRIDGE_TOKEN_HEADER = "X-JFlux-WebSocket-Bridge-Token";
 
     private final APIServerConfig config;
+    private final String recoveryEpoch = UUID.randomUUID().toString();
     private APIResources resources = new APIResources();
     private final ConcurrentHashMap<String, AsyncRequest> asyncResponses = new ConcurrentHashMap<>();
     private final ThreadExecutor requestExecutor;
@@ -175,7 +180,14 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             webSocketServer = null;
         }
         if(webSocketExecutor != null) {
-            webSocketExecutor.shutdownNow();
+            webSocketExecutor.shutdown();
+            try {
+                if (!webSocketExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS))
+                    webSocketExecutor.shutdownNow();
+            } catch (InterruptedException interrupted) {
+                webSocketExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
             webSocketExecutor = null;
         }
         if(httpServer != null) {
@@ -303,6 +315,38 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return new ArrayList<>(addresses);
 
         }
+    }
+
+    /** Caller must establish ownership before using this administrative exact-session operation. */
+    public boolean revokeSessionByKeyHash(String apiKeyHash, String sessionId) throws APIException {
+        if (apiKeyHash == null || !apiKeyHash.matches("[a-f0-9]{64}") || sessionId == null || sessionId.isBlank() || sessionId.length() > 191)
+            throw ExceptionHandling.invalid("Exact session revocation scope required.");
+        for (ClientSession session : getClientSessions()) {
+            String key = session.getSession().getApiKeys().getKey();
+            if (SecureCompare.equals(com.fortrow.jflux.crypto.builtin.SHA.get256(key), apiKeyHash)
+                    && SecureCompare.equals(session.getSession().getSessionId(), sessionId)) return revokeSession(key,sessionId);
+        }
+        resumeTokenStore.invalidateForSessionHash(apiKeyHash,sessionId);
+        return false;
+    }
+
+    /** Revoke one exact session and its resume tokens without changing root credentials or sibling sessions. */
+    public boolean revokeSession(String apiKey, String sessionId) throws APIException {
+        if (apiKey == null || apiKey.isBlank() || sessionId == null || sessionId.isBlank())
+            throw ExceptionHandling.invalid("Exact API key and session ID required.");
+        var exchangeLock = encryptedExchangeLocks[Math.floorMod(apiKey.hashCode(), encryptedExchangeLocks.length)];
+        exchangeLock.lock();
+        try {
+            resumeTokenStore.invalidateForSession(apiKey, sessionId);
+            boolean found = false;
+            for (ClientSession session : getClientSessions()) {
+                if (SecureCompare.equals(session.getSession().getApiKeys().getKey(), apiKey)
+                        && SecureCompare.equals(session.getSession().getSessionId(), sessionId)) {
+                    invalidateSession(session); found = true;
+                }
+            }
+            return found;
+        } finally { exchangeLock.unlock(); }
     }
 
     public void invalidateSession(ClientSession clientSession) {
@@ -824,9 +868,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     params.setProtocols(engine.getEnabledProtocols());
 
                     SSLParameters defaultSSLParameters = this.getSSLContext().getDefaultSSLParameters();
+                    if (config.isNeedClientAuth()) defaultSSLParameters.setNeedClientAuth(true);
+                    else defaultSSLParameters.setWantClientAuth(config.isWantClientAuth());
                     params.setSSLParameters(defaultSSLParameters);
-                    params.setWantClientAuth(config.isWantClientAuth());
-                    params.setNeedClientAuth(config.isNeedClientAuth());
                 } catch (Exception ex) {
                     ExceptionHandling.report(ex);
                 }
@@ -1081,6 +1125,27 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 final String resource = resourceFromPath(path);
 
+                if(config.isCheckpointRecoveryEnabled() && isEncrypted()
+                        && (peerIdentityAuthorizer!=null && config.isNeedClientAuth() || config.getCheckpointRecoveryAuthorizer()!=null)
+                        && com.fortrow.jflux.http.api.session.CheckpointRecovery.RESOURCE.equals(resource)) {
+                    try {
+                        if(!"POST".equals(method) || headers.hasAnyDuplicate("X-Api-Key")) {sink.unauthorized();return;}
+                        String key=headers.getString("X-Api-Key");APIKeys material=lookupApiKeys(key);
+                        if(config.getCheckpointRecoveryAuthorizer()!=null && !config.getCheckpointRecoveryAuthorizer().test(key)){sink.unauthorized();return;}
+                        if(material==null || !material.ipIsAllowed(ipAddr)){sink.unauthorized();return;}
+                        String raw=bodyFromStream(requestBody.get());
+                        if(raw.length()>2048){sink.tooLarge();return;}
+                        JSONObject challenge=JSON.getObject(raw);
+                        long now=System.currentTimeMillis();
+                        if(!com.fortrow.jflux.http.api.session.CheckpointRecovery.authorized(challenge,key,material.getSecret(),material.getPsk(),now)){sink.unauthorized();return;}
+                        invalidateOldSessions(key);
+                        JSONObject receipt=com.fortrow.jflux.http.api.session.CheckpointRecovery.seal(challenge,
+                            material.getSecret(),material.getPsk(),material.getRawSessionSecret(),activeSessionsForApiKey(key),recoveryEpoch,now);
+                        sink.send(200,receipt.toJSONString(),ContentType.JSON);
+                    }catch(Exception | APIException unavailable){sink.unauthorized();}
+                    return;
+                }
+
                 if (!RequestParser.verifyResource(getApiResources(), isEncrypted() ? config.getEncryptedSessionPaths() : new String[]{}, config.getResponsePath(), resource)) {
                     log.write("Invalid resource '" + resource + "' requested.");
                     sink.fail("Invalid resource.");
@@ -1240,7 +1305,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                         clientSession = appendNewClient(apiKeys, new ClientInfo(
                                 headers, ipAddr, hostname
-                        ));
+                        ), headers);
 
                         client = clientSession.getClient();
                         synchronized (sessionStateLock) {
@@ -1291,7 +1356,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         try {
                             clientSession = appendNewSession(client, apiKeys, new ClientInfo(
                                     headers, ipAddr, hostname
-                            ));
+                            ), headers);
                         } catch (APIException e) {
                             log.write("Server Error: " + e.getMessage());
                             ExceptionHandling.report(e);
@@ -1737,18 +1802,25 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return new APIResponse(null, response, ResponseCode.SUCCESSFUL, false);
         }
 
-        private ClientSession appendNewClient(APIKeys keys, ClientInfo info) throws APIException {
+        private ClientSession appendNewClient(APIKeys keys, ClientInfo info, RequestHeaders headers) throws APIException {
 
-            return ClientSession.createClient(info, keys, APIServer.this, isEncrypted());
+            return ClientSession.createClient(info, keys, APIServer.this, isEncrypted(), bootstrapClientPublicKey(headers));
 
         }
 
-        private ClientSession appendNewSession(RemoteClient client, APIKeys keys, ClientInfo info) throws APIException {
+        private ClientSession appendNewSession(RemoteClient client, APIKeys keys, ClientInfo info, RequestHeaders headers) throws APIException {
 
             APISession session = new APISession(keys.copyForSession(), info.getRemoteIp(), config.getServerType(),
-                    config.getMinutesTillInvalid(), config.isSessionExpirationEnabled(), isEncrypted());
+                    config.getMinutesTillInvalid(), config.isSessionExpirationEnabled(), isEncrypted(),
+                    config.getEncryptedCryptoSuite(), bootstrapClientPublicKey(headers));
             return new ClientSession(info, client, session);
 
+        }
+
+        private byte[] bootstrapClientPublicKey(RequestHeaders headers) {
+            if (!isEncrypted()) return null;
+            String encoded = headers.getString(EncryptedApiCryptoSuite.CLIENT_KEY_HEADER);
+            return encoded == null ? null : BaseX.bytesFrom64(encoded);
         }
 
         private void invalidateSessionsByLimitUsingIp(RemoteClient client) {
@@ -1786,6 +1858,9 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     int randomLength = randomBytes == null ? -1 : randomBytes.length();
                     log.write("API " + phase + " authorization failed: " + ex.getMessage() + " random_header_length=" + randomLength);
                     ExceptionHandling.report(ex);
+                    return false;
+                } catch (RuntimeException ex) {
+                    new APIException("Rejected invalid encrypted API key-envelope material.", ex).tryReport();
                     return false;
                 }
 
@@ -1991,6 +2066,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     "X-Request-Sequence", "X-Api-Session-Id", "X-Api-Key-Set-Id",
                     "X-Api-Session-Authorization", "X-Api-Authorization", "X-Api-Random-Bytes",
                     "X-Api-Reset-Authorization", "X-Api-Resource-Method",
+                    EncryptedApiCryptoSuite.SUITE_HEADER, EncryptedApiCryptoSuite.CLIENT_KEY_HEADER,
                     "Content-Transfer-Encoding", "Content-Type"
             )) {
                 return false;
@@ -2001,6 +2077,24 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             ) {
 
                 if(isSessionBootstrapResource(resource)) {
+
+                    if (isSessionInitOrResumeResource(resource)) {
+                        EncryptedApiCryptoSuite suite = config.getEncryptedCryptoSuite();
+                        String requested = headers.getString(EncryptedApiCryptoSuite.SUITE_HEADER);
+                        String clientKey = headers.getString(EncryptedApiCryptoSuite.CLIENT_KEY_HEADER);
+                        // Old RSA clients omit both headers. A configured PQ suite never falls back.
+                        if (requested == null && clientKey == null) {
+                            if (suite.isPostQuantum()) return false;
+                        } else {
+                            if (!suite.id().equals(requested) || clientKey == null || clientKey.length() > 2200) return false;
+                            try {
+                                suite.publicKey(BaseX.bytesFrom64(clientKey));
+                            } catch (RuntimeException invalidKey) {
+                                new APIException("Rejected an invalid encrypted API bootstrap public key.", invalidKey).tryReport();
+                                return false;
+                            }
+                        }
+                    }
 
                     return headers.contains("X-Request-Timestamp")
                             && headers.contains("X-Api-Key")
@@ -2075,6 +2169,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
             InboundRequest inboundRequest = new InboundRequest(clientSession, params, headers);
             inboundRequest.setResourceMethod(resourceMethod);
+            inboundRequest.setResourcePath(resourceName);
 
             if(isEncrypted()) {
 
@@ -2101,7 +2196,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                         return new APIResponse(clientSession, ResponseCode.UNAUTHORIZED);
                     }
 
-                    return processRequestEncryptedSync(clientSession, resource, params, headers, requestType, resourceMethod);
+                    return processRequestEncryptedSync(clientSession, resource, params, headers, requestType, resourceMethod, resourceName);
                 }
 
                 if(!isAuthenticated(headers, resource, params, clientSession)) {
@@ -2126,7 +2221,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                     return processRequestAsync(resource, inboundRequest, true);
                 }
 
-                return processRequestEncryptedSync(clientSession, resource, params, headers, EncryptedRequestType.EXECUTE_RESOURCE, resourceMethod);
+                return processRequestEncryptedSync(clientSession, resource, params, headers, EncryptedRequestType.EXECUTE_RESOURCE, resourceMethod, resourceName);
 
             } else if(config.getServerType() == APIServerType.REST_SYNC || config.getServerType() == APIServerType.REST_ASYNC) {
 
@@ -2205,7 +2300,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
             return response;
         }
 
-        private APIResponse processRequestEncryptedSync(ClientSession clientSession, APIResource resource, BodyParameters params, RequestHeaders headers, EncryptedRequestType type, String resourceMethod) throws Exception {
+        private APIResponse processRequestEncryptedSync(ClientSession clientSession, APIResource resource, BodyParameters params, RequestHeaders headers, EncryptedRequestType type, String resourceMethod, String resourceName) throws Exception {
             if(type == EncryptedRequestType.SESSION_INIT || type == EncryptedRequestType.SESSION_RESUME) {
                 APIResponse resp = initializeSession(clientSession);
                 resp.encryptWithPsk();
@@ -2218,6 +2313,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
                 InboundRequest inboundRequest = new InboundRequest(clientSession, params, headers);
                 inboundRequest.setResourceMethod(resourceMethod);
+            inboundRequest.setResourcePath(resourceName);
 
                 if (!headers.getString("X-Api-Key-Set-Id").equals(clientSession.getSession().getKeySetId())) {
                     lockSessionApiKey(clientSession, "Invalid API key-set id.");
@@ -2257,12 +2353,7 @@ public abstract class APIServer implements ClientFilter, APIEvents {
                             .getPublicKey()
                             .getEncoded());
 
-            String clientPrivateKey = BaseX.encode64(
-                    clientSession
-                            .getSession()
-                            .getClientPrivateKey()
-                            .getPrivateKey()
-                            .getEncoded());
+            var transferredClientKey = clientSession.getSession().getClientPrivateKey();
 
             String keySetId = clientSession
                     .getSession()
@@ -2270,7 +2361,12 @@ public abstract class APIServer implements ClientFilter, APIEvents {
 
             obj.put("random_bytes", randomBytes);
             obj.put("server_public_key", serverPublicKey);
-            obj.put("client_private_key", clientPrivateKey);
+            obj.put("crypto_suite", clientSession.getSession().getCryptoSuite().id());
+            obj.put("client_public_key", BaseX.encode64(clientSession.getSession().getClientPublicKey().getPublicKey().getEncoded()));
+            if (transferredClientKey != null) {
+                // Compatibility only for pre-1.2.0 RSA clients without a public-key header.
+                obj.put("client_private_key", BaseX.encode64(transferredClientKey.getPrivateKey().getEncoded()));
+            }
             obj.put("key_set_id", keySetId);
             obj.put("request_status", "success");
 
@@ -2348,6 +2444,11 @@ public abstract class APIServer implements ClientFilter, APIEvents {
         }
 
         private APIResponse sessionHeartbeat(ClientSession clientSession, BodyParameters params) throws Exception {
+            if (params != null && params.present("client_metadata")) {
+                Object value = params.get("client_metadata");
+                if (!(value instanceof java.util.Map<?,?> metadata)) throw ExceptionHandling.invalid("Invalid session metadata.");
+                clientSession.getSession().setReportedMetadata(metadata);
+            }
             JSONObject obj = new JSONObject();
             obj.put("request_status", "success");
             obj.put("session_id", clientSession.getSession().getSessionId());

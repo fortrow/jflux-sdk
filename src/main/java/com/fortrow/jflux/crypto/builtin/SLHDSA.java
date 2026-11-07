@@ -1,14 +1,37 @@
+/*
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ */
+
 package com.fortrow.jflux.crypto.builtin;
 
 import com.fortrow.jflux.crypto.adapters.SignatureAlgorithm;
 import com.fortrow.jflux.exceptions.ExceptionHandling;
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSAKeyGenerationParameters;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSAKeyPairGenerator;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSAParameters;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSAPrivateKeyParameters;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSAPublicKeyParameters;
-import org.bouncycastle.pqc.crypto.slhdsa.SLHDSASigner;
+import org.bouncycastle.crypto.params.SLHDSAKeyGenerationParameters;
+import org.bouncycastle.crypto.generators.SLHDSAKeyPairGenerator;
+import org.bouncycastle.crypto.params.SLHDSAParameters;
+import org.bouncycastle.crypto.params.SLHDSAPrivateKeyParameters;
+import org.bouncycastle.crypto.params.SLHDSAPublicKeyParameters;
+import org.bouncycastle.crypto.signers.SLHDSASigner;
 
 import java.security.SecureRandom;
 
@@ -22,7 +45,7 @@ public final class SLHDSA {
 
     public static boolean isAvailable() {
         try {
-            Class.forName("org.bouncycastle.pqc.crypto.slhdsa.SLHDSAParameters");
+            Class.forName("org.bouncycastle.crypto.params.SLHDSAParameters");
             return true;
         } catch (ClassNotFoundException | LinkageError e) {
             return false;

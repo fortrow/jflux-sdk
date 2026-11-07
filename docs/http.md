@@ -1,9 +1,63 @@
 # HTTP, REST, and encrypted APIs
 
-JFlux 1.1.1 treats HTTP failures, invalid request data, and encrypted protocol
+JFlux 1.2.0 treats HTTP failures, invalid request data, and encrypted protocol
 failures as reportable API events through `APIException`, which extends
 `ReportedException`. Applications can configure the normal exception reporting
 policy and use `tryReport()` when an API failure should be escalated explicitly.
+
+## Configurable post-quantum API encryption (1.2.0)
+
+Select the same `EncryptedApiCryptoSuite` on both peers before opening a session:
+
+```java
+import com.fortrow.jflux.http.api.server.encryption.EncryptedApiCryptoSuite;
+
+APIServerConfig config = new APIServerConfig(8443, "/api")
+        .useDynamicApiKey(true)
+        .setEncryptedCryptoSuite(EncryptedApiCryptoSuite.ML_KEM_768);
+
+// Construct client with your existing credentials and transport configuration.
+client.setEncryptedCryptoSuite(EncryptedApiCryptoSuite.ML_KEM_768);
+client.beginSessionOrThrow("/session/init", "/session/close");
+```
+
+Options are `RSA_2048` (compatibility default), `ML_KEM_512`, `ML_KEM_768`, and
+`ML_KEM_1024`. ML-KEM implements the key-encapsulation algorithm standardized in
+[NIST FIPS 203](https://csrc.nist.gov/pubs/fips/203/final). Its shared secret derives
+an AES-256-GCM wrapping key through HKDF-SHA256. This replaces RSA around each
+rotating payload-key envelope. Payload encryption remains AES-256-GCM, with the
+existing HMAC authentication, sequence checking, session allocation, and resume
+rules. Enable `useDynamicApiKey(true)` for rotating key envelopes.
+
+New clients generate their own key pair for both RSA and ML-KEM, sending only
+`X-JFlux-Client-Public-Key` and the explicit `X-JFlux-Crypto-Suite` on init/resume.
+The server generates its own pair. The PSK-authenticated bootstrap response names
+the suite and confirms the client public key. Neither endpoint transfers its
+private key. Every resumed session creates fresh pairs. The configured suite is
+required: missing or mismatched PQ negotiation is rejected before consuming a
+resume token, with no automatic downgrade to RSA. Duplicate negotiation headers
+and malformed public keys are rejected.
+
+The encrypted CORS policy includes both negotiation headers. Key-envelope header
+values are bounded before Base64 decoding, and failed session bootstrap discards
+the client's temporary session keys.
+Client session checks reject empty session material, so suite selection works
+before initialization and cleared sessions cannot issue authenticated requests.
+
+The RSA default retains compatibility with old clients that omit both negotiation
+headers: only that legacy path still transfers a server-generated client private
+key under the PSK. New RSA clients can also read that bootstrap format from old
+servers that do not advertise a crypto suite. Responses advertising a suite
+cannot supply a client private key. ML-KEM clients always require client-owned
+private keys.
+
+This policy applies to HTTP and WebSocket, sync and async resources, and binary
+WebSocket payloads because they share the key-envelope implementation. It does
+not change TLS cipher suites or certificate algorithms. Continue using HTTPS/WSS,
+and mTLS where required; the PSK and API root credentials remain necessary for
+authentication. Standard Bouncy Castle implements these algorithms but is not a
+FIPS 140 validated module. The full and HTTP shaded JARs bundle its provider;
+unshaded Maven consumers must add the optional provider explicitly.
 
 ## Server request boundaries
 
@@ -238,3 +292,10 @@ reads authenticated binary plaintext; `APIResponse.binary` returns bytes; verifi
 `EncryptedResponse.getBodyBytes` exposes the reply. HTTP and session-control
 requests retain their existing text/JSON formats. See `websockets.md` for framing,
 size bounds, and application metadata authentication requirements.
+
+### Encrypted WebSocket shutdown
+
+`APIServer.stop()` closes the WebSocket listener and drains its request executor
+for up to five seconds before interrupting outstanding tasks. Shutdown preserves
+the thread interrupt status. The drain prevents authenticated close/ratchet
+writes from racing caller-owned database or temporary-directory cleanup.

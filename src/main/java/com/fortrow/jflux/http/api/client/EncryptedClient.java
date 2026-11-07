@@ -1,29 +1,31 @@
 /*
- * -------------------------------------------------------------------------
+ * Copyright (c) 2026 Fortrow LLC.
  *
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
  *
- * NOTICE: All information contained herein is, and remains the property of
- * Fortrow, LLC. The intellectual and technical concepts contained herein are
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents,
- * patents in process, and are protected by trade secret or copyright law.
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
  *
- * Dissemination of this information or reproduction of this material is
- * strictly forbidden unless prior written permission is obtained from
- * Fortrow, LLC.
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
  *
- * -------------------------------------------------------------------------
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
  *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-10 22:56:32 EDT
- *
- * -------------------------------------------------------------------------
-
  */
 package com.fortrow.jflux.http.api.client;
 
 import com.fortrow.jflux.crypto.Rand;
 import com.fortrow.jflux.crypto.builtin.AES;
-import com.fortrow.jflux.crypto.builtin.RSA;
 import com.fortrow.jflux.crypto.builtin.SHA;
 import com.fortrow.jflux.encoding.BaseX;
 import com.fortrow.jflux.encoding.Hex;
@@ -31,6 +33,7 @@ import com.fortrow.jflux.exceptions.ExceptionHandling;
 import com.fortrow.jflux.http.api.server.config.HttpVersion;
 import com.fortrow.jflux.http.api.server.exceptions.APIException;
 import com.fortrow.jflux.http.api.server.encryption.APIKeys;
+import com.fortrow.jflux.http.api.server.encryption.EncryptedApiCryptoSuite;
 import com.fortrow.jflux.http.api.server.session.SessionAllocationAssertion;
 import com.fortrow.jflux.http.api.types.EncryptedResponseType;
 import com.fortrow.jflux.output.json.JSON;
@@ -80,6 +83,8 @@ public class EncryptedClient implements AutoCloseable {
     private MtlsConfig mtlsConfig;
     private SSLContext webSocketSslContext;
     private Duration webSocketRequestTimeout = EncryptedWebSocketTransport.DEFAULT_REQUEST_TIMEOUT;
+    private int http1TimeoutMillis;
+    private int http1ResponseLimit;
 
     private String endpointUri = "";
     private String http3UpgradeUri;
@@ -101,6 +106,18 @@ public class EncryptedClient implements AutoCloseable {
     private String sessionResumePath = "/session/resume";
     private String sessionResetPath = "/session/reset";
     private String sessionAllocatePath = "/session/allocate";
+    private volatile java.util.Map<String,String> sessionMetadata = java.util.Map.of();
+    public EncryptedClient setSessionMetadata(java.util.Map<String,String> metadata) {
+        sessionMetadata = SessionMetadata.validate(metadata); return this;
+    }
+    /** Sends only explicitly configured hints, over the authenticated encrypted heartbeat. */
+    public EncryptedResponse reportSessionMetadata() throws APIException {
+        JSONObject body = new JSONObject(); body.put("client_metadata", new JSONObject(sessionMetadata));
+        EncryptedResponse response = request(sessionHeartbeatPath, body);
+        if (response == null || response.getStatus() != 200 || !response.isVerified()
+            || !"success".equals(response.getRequestStatus())) throw new APIException("Session metadata report was not confirmed.");
+        return response;
+    }
     private String sessionHeartbeatPath = "/session/heartbeat";
     private String responsePath = "/response";
     private SecretStore sessionSecretStore;
@@ -112,6 +129,42 @@ public class EncryptedClient implements AutoCloseable {
     private byte[] keyTransferBytes;
     private PublicKey serverPublic;
     private PrivateKey clientPrivate;
+    private PublicKey clientPublic;
+    private EncryptedApiCryptoSuite cryptoSuite = EncryptedApiCryptoSuite.RSA_2048;
+
+    /** Selects the required server suite before initializing a session; no automatic fallback. */
+    public EncryptedClient setEncryptedCryptoSuite(EncryptedApiCryptoSuite suite) {
+        exchangeLock.lock();
+        try {
+            if (hasActiveSession()) throw ExceptionHandling.invalid("Close the session before changing its crypto suite.");
+            if (suite == null) throw ExceptionHandling.invalid("Encrypted API crypto suite is required.");
+            suite.requireAvailable();
+            this.cryptoSuite = suite;
+            return this;
+        } finally { exchangeLock.unlock(); }
+    }
+
+    public EncryptedApiCryptoSuite getEncryptedCryptoSuite() { return cryptoSuite; }
+
+    private void prepareBootstrapKeys(Map<String, String> headers) {
+        destroyClientPrivateKey();
+        byte[][] pair = cryptoSuite.generateKeyPair();
+        try {
+            clientPublic = cryptoSuite.publicKey(pair[0]);
+            clientPrivate = cryptoSuite.privateKey(pair[1]);
+            headers.put(EncryptedApiCryptoSuite.SUITE_HEADER, cryptoSuite.id());
+            headers.put(EncryptedApiCryptoSuite.CLIENT_KEY_HEADER, BaseX.encode64(pair[0]));
+        } finally { Arrays.fill(pair[1], (byte) 0); }
+    }
+
+    private void destroyClientPrivateKey() {
+        if (clientPrivate != null) {
+            try { clientPrivate.destroy(); }
+            catch (javax.security.auth.DestroyFailedException ignored) { }
+        }
+        clientPrivate = null;
+        clientPublic = null;
+    }
     private long requestSequence = 0;
     private final Thread shutdownHook;
     private volatile boolean closed;
@@ -165,6 +218,16 @@ public class EncryptedClient implements AutoCloseable {
 
     public EncryptedClient setMtlsConfig(MtlsConfig mtlsConfig) {
         this.mtlsConfig = mtlsConfig;
+        return this;
+    }
+
+    /** Opt-in bounded HTTP/1 profile; no redirects, decompression or automatic request retries. */
+    public EncryptedClient setHttp1Limits(Duration timeout, int maxResponseBytes) {
+        if (httpVersion != HttpVersion.HTTP_1 || isWebSocketEndpoint() || http1Client != null
+                || timeout == null || timeout.toMillis() < 1 || timeout.toMillis() > 60000
+                || maxResponseBytes < 1 || maxResponseBytes > 64 * 1024 * 1024)
+            throw ExceptionHandling.invalid("Invalid HTTP/1 limits or client already built.");
+        http1TimeoutMillis = (int) timeout.toMillis(); http1ResponseLimit = maxResponseBytes;
         return this;
     }
 
@@ -243,7 +306,13 @@ public class EncryptedClient implements AutoCloseable {
                         builder.loadTrustMaterial(null, (TrustStrategy) null);
                     }
                     sslContext = builder.build();
-                    var clientBuilder = HttpClients.custom().setSSLContext(sslContext);
+                    // Even bootstrap GET mutates session state. Transport-level replay
+                    // and HTTP redirects must not repeat an encrypted exchange.
+                    var clientBuilder = HttpClients.custom().setSSLContext(sslContext).disableAutomaticRetries().disableRedirectHandling();
+                    if (http1TimeoutMillis > 0) clientBuilder.disableRedirectHandling().disableAutomaticRetries().disableContentCompression()
+                            .setDefaultRequestConfig(org.apache.http.client.config.RequestConfig.custom()
+                                    .setConnectTimeout(Math.min(2000, http1TimeoutMillis))
+                                    .setConnectionRequestTimeout(http1TimeoutMillis).setSocketTimeout(http1TimeoutMillis).build());
                     if (allowSelfSigned) clientBuilder.setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
                     http1Client = clientBuilder.build();
                 } catch (NoSuchAlgorithmException | KeyManagementException | KeyStoreException e) {
@@ -373,6 +442,22 @@ public class EncryptedClient implements AutoCloseable {
         } finally { exchangeLock.unlock(); }
     }
 
+    /** Recover only a server-authenticated checkpoint after its old session expires. No application request is replayed. */
+    public boolean recoverCheckpointOrThrow(String path) throws APIException {
+        exchangeLock.lock();
+        try {
+            if(endpointUri==null || !endpointUri.startsWith("https://") && !endpointUri.startsWith("wss://"))throw new APIException("Recovery requires TLS");
+            String psk=readSecret(pskStore,"PSK");
+            JSONObject challenge=com.fortrow.jflux.http.api.session.CheckpointRecovery.request(apiKey,secret,psk,System.currentTimeMillis());
+            EncryptedResponse response=postBootstrap(fixPath(path),challenge,EncryptedResponseType.SESSION_RESUME);
+            JSONObject result=response.getBodyObject();if(result.isEmpty())result=response.getData();
+            var recovered=com.fortrow.jflux.http.api.session.CheckpointRecovery.open(challenge,result,secret,psk,System.currentTimeMillis());
+            if(recovered.isEmpty())return false;
+            clearSessionState();persistAuthenticatedSessionSecret(recovered.get());return true;
+        }catch(APIException e){throw e;}catch(Exception invalid){throw new APIException("Authenticated checkpoint recovery unavailable",invalid);}
+        finally{exchangeLock.unlock();}
+    }
+
     public EncryptedResponse closeSessionOrThrow() throws APIException {
         exchangeLock.lock();
         try {
@@ -492,6 +577,7 @@ public class EncryptedClient implements AutoCloseable {
             String sequence = String.valueOf(++requestSequence);
             JSONObject requestBody = body == null ? new JSONObject() : new JSONObject(body);
             boolean sessionCloseRequest = isSessionClosePath(fixedPath);
+            if(sessionCloseRequest && httpVersion==HttpVersion.HTTP_1 && !isWebSocketEndpoint())headers.put("Connection","close");
             if(sessionCloseRequest) authorizeSessionClose(requestBody, sequence);
             String plaintext = JSON.getString(requestBody);
             String contentType = "application/json";
@@ -743,8 +829,13 @@ public class EncryptedClient implements AutoCloseable {
             this.sessionHeartbeatPath = fixPath(sessionHeartbeatPath);
             this.sessionSecret = SHA.get256(currentRawSessionSecret());
 
-            if (!readOptionalSecret(resumeTokenStore).isBlank() && resume()) return true;
-            return init();
+            boolean opened = !readOptionalSecret(resumeTokenStore).isBlank() && resume();
+            if (!opened) opened = init();
+            if (opened && !sessionMetadata.isEmpty()) {
+                try { reportSessionMetadata(); }
+                catch (APIException error) { lastSessionInitError = "Session metadata report was not confirmed."; return false; }
+            }
+            return opened;
 
 
         } finally { exchangeLock.unlock(); }
@@ -907,6 +998,7 @@ public class EncryptedClient implements AutoCloseable {
 
         String randomBytesHex = getRandomBytes(44);
         HashMap<String, String> headers = new HashMap<String, String>();
+        prepareBootstrapKeys(headers);
         headers.put("Content-Type", "application/json");
         headers.put("X-Api-Key", apiKey);
         headers.put("X-Api-Random-Bytes", randomBytesHex);
@@ -921,6 +1013,7 @@ public class EncryptedClient implements AutoCloseable {
             response = get(this.sessionInitPath, headers, EncryptedResponseType.SESSION_INIT);
         } catch (APIException e) {
             lastSessionInitError = e.getMessage();
+            clearSessionState();
             return false;
         }
 
@@ -941,12 +1034,14 @@ public class EncryptedClient implements AutoCloseable {
         headers.put("X-Api-Random-Bytes", randomBytesHex);
         headers.put("X-Request-Timestamp", Long.toString(System.currentTimeMillis() / 1000));
         headers.put("X-Api-Session-Authorization", sessionSecret);
+        prepareBootstrapKeys(headers);
         lastSessionInitError = "";
         EncryptedResponse response;
         try {
             response = postBootstrap(sessionResumePath, body, EncryptedResponseType.SESSION_RESUME, headers);
         } catch (APIException e) {
             lastSessionInitError = e.getMessage();
+            clearSessionState();
             return false;
         }
         if (!finishBootstrap(response, "Session resume")) return false;
@@ -955,6 +1050,16 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     private boolean finishBootstrap(EncryptedResponse response, String label) {
+        boolean success = false;
+        try {
+            success = finishBootstrapExchange(response, label);
+            return success;
+        } finally {
+            if (!success) clearSessionState();
+        }
+    }
+
+    private boolean finishBootstrapExchange(EncryptedResponse response, String label) {
         if(response == null) {
             lastSessionInitError = "No response was returned from " + label.toLowerCase() + ".";
             return false;
@@ -999,6 +1104,7 @@ public class EncryptedClient implements AutoCloseable {
         try {
             if(closed) return;
             closed = true;
+            clearSessionState();
             if(http3Transport != null) {
                 http3Transport.close();
                 http3Transport = null;
@@ -1039,12 +1145,31 @@ public class EncryptedClient implements AutoCloseable {
         if(psk.length() != 64) throw new RuntimeException("Invalid length for Pre-Shared Key");
         byte[] key = Hex.fromHex(psk);
         if(!__.isset(key)) throw new RuntimeException("Invalid Pre-Shared Key");
-        String resp = new String(Objects.requireNonNull(AES.gcm(BaseX.bytesFrom64(ciphertext), key, Hex.fromHex(iv), null, false)));
+        byte[] plaintext;
+        try {
+            plaintext = Objects.requireNonNull(AES.gcm(BaseX.bytesFrom64(ciphertext), key, Hex.fromHex(iv), null, false));
+        } finally { Arrays.fill(key, (byte) 0); }
+        String resp;
+        try {
+            resp = new String(plaintext, StandardCharsets.UTF_8);
+        } finally { Arrays.fill(plaintext, (byte) 0); }
         json = JSON.getObject(resp);
         if(!__.isset(json)) throw new RuntimeException("Failed to parse request JSON.");
         this.sessionId = (String) json.get("session_id");
-        this.serverPublic = RSA.publicKeyFromBytes(BaseX.bytesFrom64((String) json.get("server_public_key")));
-        this.clientPrivate = RSA.privateKeyFromBytes(BaseX.bytesFrom64((String) json.get("client_private_key")));
+        String selectedSuite = (String) json.get("crypto_suite");
+        if (selectedSuite == null) selectedSuite = EncryptedApiCryptoSuite.RSA_2048.id();
+        if (!cryptoSuite.id().equals(selectedSuite)) throw ExceptionHandling.invalid("The server selected an unexpected encrypted API crypto suite.");
+        this.serverPublic = cryptoSuite.publicKey(BaseX.bytesFrom64((String) json.get("server_public_key")));
+        if (json.containsKey("client_private_key")) {
+            // Old RSA servers cannot accept client-owned keys. PQ clients never accept this path.
+            if (cryptoSuite.isPostQuantum() || json.containsKey("crypto_suite"))
+                throw ExceptionHandling.invalid("A server advertising a crypto suite must not transfer the client's private key.");
+            destroyClientPrivateKey();
+            this.clientPrivate = cryptoSuite.privateKey(BaseX.bytesFrom64((String) json.get("client_private_key")));
+        } else if (clientPublic == null || !Arrays.equals(clientPublic.getEncoded(),
+                BaseX.bytesFrom64((String) json.get("client_public_key")))) {
+            throw ExceptionHandling.invalid("Bootstrap response did not confirm the client's public key.");
+        }
         this.keySetId = (String) json.get("key_set_id");
         this.activeSecret = (String) json.get("session_secret");
         this.keyTransferBytes = Hex.fromHex((String) json.get("random_bytes"));
@@ -1085,12 +1210,12 @@ public class EncryptedClient implements AutoCloseable {
     }
 
     private boolean hasActiveSession() {
-        return __.isset(sessionId)
-                && __.isset(keySetId)
-                && __.isset(activeSecret)
-                && __.isset(nextRandom)
-                && __.isset(nextAuthorization)
-                && __.isset(nextSessionAuthorization);
+        return !__.isEmpty(sessionId)
+                && !__.isEmpty(keySetId)
+                && !__.isEmpty(activeSecret)
+                && !__.isEmpty(nextRandom)
+                && !__.isEmpty(nextAuthorization)
+                && !__.isEmpty(nextSessionAuthorization);
     }
 
     private void clearSessionState() {
@@ -1104,7 +1229,7 @@ public class EncryptedClient implements AutoCloseable {
         keySetId = "";
         keyTransferBytes = null;
         serverPublic = null;
-        clientPrivate = null;
+        destroyClientPrivateKey();
         requestSequence = 0;
     }
 
@@ -1232,7 +1357,7 @@ public class EncryptedClient implements AutoCloseable {
 
     }
 
-    private static class Http1Request implements ExecutesClientRequest {
+    private class Http1Request implements ExecutesClientRequest {
 
         private final CloseableHttpClient httpClient;
         private RequestType requestMethod;
@@ -1306,6 +1431,14 @@ public class EncryptedClient implements AutoCloseable {
 
         @Override
         public void execute() {
+            java.util.concurrent.ScheduledExecutorService deadline = null;
+            if (http1TimeoutMillis > 0) {
+                deadline = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "jflux-http1-deadline"); t.setDaemon(true); return t;
+                });
+                deadline.schedule(() -> { if (get != null) get.abort(); if (post != null) post.abort(); },
+                        http1TimeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
             try {
                 if (requestMethod == RequestType.GET) {
                     try (CloseableHttpResponse response = this.httpClient.execute(get)) {
@@ -1322,11 +1455,18 @@ public class EncryptedClient implements AutoCloseable {
                 }
             } catch (IOException e) {
                 throw new RuntimeException(e);
-            }
+            } finally { if (deadline != null) deadline.shutdownNow(); }
         }
 
-        private static String bodyFromEntity(HttpEntity entity) throws IOException {
-            return entity == null ? "" : EntityUtils.toString(entity, StandardCharsets.UTF_8);
+        private String bodyFromEntity(HttpEntity entity) throws IOException {
+            if (entity == null) return "";
+            if (http1ResponseLimit == 0) return EntityUtils.toString(entity, StandardCharsets.UTF_8);
+            if (entity.getContentLength() > http1ResponseLimit) throw new IOException("Encrypted response exceeds configured bound.");
+            try (var input = entity.getContent()) {
+                byte[] bytes = input.readNBytes(http1ResponseLimit + 1);
+                if (bytes.length > http1ResponseLimit) throw new IOException("Encrypted response exceeds configured bound.");
+                return new String(bytes, StandardCharsets.UTF_8);
+            }
         }
     }
 

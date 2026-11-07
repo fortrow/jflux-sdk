@@ -1,23 +1,26 @@
 /*
- * -------------------------------------------------------------------------
- * 
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
- *  
- * NOTICE: All information contained herein is, and remains the property of 
- * Fortrow, LLC. The intellectual and technical concepts contained herein are 
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
- * patents in process, and are protected by trade secret or copyright law.
- * 
- * Dissemination of this information or reproduction of this material is 
- * strictly forbidden unless prior written permission is obtained from 
- * Fortrow, LLC.
- * 
- * -------------------------------------------------------------------------
- * 
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-04 15:27:04 EDT
- * 
- * -------------------------------------------------------------------------
-
  */
 package com.fortrow.jflux.crypto;
 
@@ -73,17 +76,17 @@ public class CryptographyRegister {
         register.register("ed25519", DefaultAlgorithms.ed25519());
         register.register("rsa-2048", DefaultAlgorithms.rsa(2048));
         register.register("rsa-4096", DefaultAlgorithms.rsa());
-        if (PqcAvailability.available("org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters")) {
+        if (PqcAvailability.available("org.bouncycastle.crypto.params.MLKEMParameters")) {
             register.register("ml-kem-512", DefaultAlgorithms.mlKem512());
             register.register("ml-kem-768", DefaultAlgorithms.mlKem768());
             register.register("ml-kem-1024", DefaultAlgorithms.mlKem1024());
         }
-        if (PqcAvailability.available("org.bouncycastle.pqc.crypto.mldsa.MLDSAParameters")) {
+        if (PqcAvailability.available("org.bouncycastle.crypto.params.MLDSAParameters")) {
             register.register("ml-dsa-44", DefaultAlgorithms.mlDsa44());
             register.register("ml-dsa-65", DefaultAlgorithms.mlDsa65());
             register.register("ml-dsa-87", DefaultAlgorithms.mlDsa87());
         }
-        if (PqcAvailability.available("org.bouncycastle.pqc.crypto.slhdsa.SLHDSAParameters")) {
+        if (PqcAvailability.available("org.bouncycastle.crypto.params.SLHDSAParameters")) {
             register.register("slh-dsa-sha2-128s", DefaultAlgorithms.slhDsaSha2_128s());
             register.register("slh-dsa-sha2-128f", DefaultAlgorithms.slhDsaSha2_128f());
             register.register("slh-dsa-sha2-192s", DefaultAlgorithms.slhDsaSha2_192s());

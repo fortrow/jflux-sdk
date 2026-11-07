@@ -1,23 +1,26 @@
 /*
- * -------------------------------------------------------------------------
- * 
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
- *  
- * NOTICE: All information contained herein is, and remains the property of 
- * Fortrow, LLC. The intellectual and technical concepts contained herein are 
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
- * patents in process, and are protected by trade secret or copyright law.
- * 
- * Dissemination of this information or reproduction of this material is 
- * strictly forbidden unless prior written permission is obtained from 
- * Fortrow, LLC.
- * 
- * -------------------------------------------------------------------------
- * 
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-08 19:22:08 EDT
- * 
- * -------------------------------------------------------------------------
-
  */
 package com.fortrow.jflux.http.api.server.config;
 
@@ -29,6 +32,7 @@ import com.fortrow.jflux.db.supporting.DbType;
 import com.fortrow.jflux.exceptions.ExceptionHandling;
 import com.fortrow.jflux.files.LogFile;
 import com.fortrow.jflux.http.api.server.exceptions.APIException;
+import com.fortrow.jflux.http.api.server.encryption.EncryptedApiCryptoSuite;
 import com.fortrow.jflux.http.api.server.session.SessionAllocationAuthenticator;
 import com.fortrow.jflux.http.api.server.types.CORSPolicy;
 import com.fortrow.jflux.http.api.server.types.APIServerType;
@@ -43,6 +47,20 @@ import java.time.Duration;
 import java.util.Map;
 
 public final class APIServerConfig {
+
+    private EncryptedApiCryptoSuite encryptedCryptoSuite = EncryptedApiCryptoSuite.RSA_2048;
+
+    /** Selects the required key-envelope suite for newly initialized or resumed sessions. */
+    public APIServerConfig setEncryptedCryptoSuite(EncryptedApiCryptoSuite suite) {
+        if (suite == null) throw ExceptionHandling.invalid("Encrypted API crypto suite is required.");
+        suite.requireAvailable();
+        this.encryptedCryptoSuite = suite;
+        return this;
+    }
+
+    public EncryptedApiCryptoSuite getEncryptedCryptoSuite() {
+        return encryptedCryptoSuite;
+    }
 
     private final int apiPort;
     private boolean useTls = false;
@@ -67,6 +85,25 @@ public final class APIServerConfig {
     private boolean sessionExpirationEnabled = true;
     private int resumeTokenMinutes = 30;
     private boolean activeSessionRecoveryEnabled = false;
+    private boolean checkpointRecoveryEnabled = Boolean.getBoolean("jflux.checkpointRecovery.enabled");
+    private java.util.function.Predicate<String> checkpointRecoveryAuthorizer = configuredRecoveryGate();
+    private static java.util.function.Predicate<String> configuredRecoveryGate() {
+        return switch(System.getProperty("jflux.checkpointRecovery.authority","")) {
+            // The existing HTTP certificate gate must enclose the complete API path.
+            case "certificate-gate" -> key -> true;
+            case "t-api" -> {
+                String bootstrap=System.getenv("FORTROW_SERVER_API_KEY");
+                yield key -> bootstrap!=null && !bootstrap.isBlank() && key!=null && !bootstrap.equals(key);
+            }
+            default -> null;
+        };
+    }
+    /** Explicit key-scope gate for a TLS-terminating private gateway; never enable shared bootstrap identities. */
+    public APIServerConfig setCheckpointRecoveryAuthorizer(java.util.function.Predicate<String> authorizer) { checkpointRecoveryAuthorizer=java.util.Objects.requireNonNull(authorizer);return this; }
+    public java.util.function.Predicate<String> getCheckpointRecoveryAuthorizer(){return checkpointRecoveryAuthorizer;}
+    /** Opt-in read-only recovery, requiring an enrolled TLS peer authorizer. */
+    public APIServerConfig setCheckpointRecoveryEnabled(boolean enabled) { checkpointRecoveryEnabled=enabled; return this; }
+    public boolean isCheckpointRecoveryEnabled() { return checkpointRecoveryEnabled; }
     private Path sessionResumeStorePath;
     private Duration allocationChallengeLifetime = Duration.ofMinutes(5);
     /** Retained only for source compatibility with the pre-assertion allocator. */
@@ -755,6 +792,9 @@ public final class APIServerConfig {
     }
 
     public void validateOrThrow() throws APIException {
+        if (encryptedCryptoSuite.isPostQuantum() && (!useDynamicApiKey
+                || (serverType != APIServerType.ENCRYPTED_SYNC && serverType != APIServerType.ENCRYPTED_ASYNC)))
+            throw new APIException("Post-quantum API crypto requires an encrypted server with dynamic API keys enabled.");
         if(corsPolicy != null) corsPolicy.validateOrThrow();
         if (binaryWebSocketEnabled && (!webSocketEnabled || !needClientAuth || peerIdentityAuthorizer == null
                 || (webSocketSslContext == null && apiServerSslContext == null && !useTls)

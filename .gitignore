@@ -64,6 +64,42 @@ build/
 hs_err_pid*
 replay_pid*
 
+# Local documentation and AI instruction/working Markdown (at any depth)
+/scripts/
+docs/
+AGENTS.md
+AGENTS.local.md
+IMPLEMENT.md
+CODE_UPDATE.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+CODEX.md
+COPILOT.md
+CURSOR.md
+AI.md
+ai.md
+AI_*.md
+AI-*.md
+*_AI.md
+*-AI.md
+ai_*.md
+ai-*.md
+*_ai.md
+*-ai.md
+*.ai.md
+*.AI.md
+.aider*.md
+**/.github/copilot-instructions.md
+**/.github/instructions/*.instructions.md
+**/.codex/**/*.md
+**/.claude/**/*.md
+**/.gemini/**/*.md
+**/.agents/**/*.md
+**/.cursor/**/*.md
+**/.ai/**/*.md
+._.DS_Store
+
 # Local configuration, editor state, logs and operating-system metadata
 .DS_Store
 Thumbs.db

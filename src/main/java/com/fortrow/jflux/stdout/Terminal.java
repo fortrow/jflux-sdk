@@ -1,18 +1,24 @@
 /*
- * -------------------------------------------------------------------------
+ * Copyright (c) 2026 Fortrow LLC.
  *
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
  *
- * NOTICE: All information contained herein is, and remains the property of
- * Fortrow, LLC. The intellectual and technical concepts contained herein are
- * proprietary to Fortrow, LLC and may be covered by U.S. and Foreign Patents,
- * patents in process, and are protected by trade secret or copyright law.
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
  *
- * Dissemination of this information or reproduction of this material is
- * strictly forbidden unless prior written permission is obtained from
- * Fortrow, LLC.
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
  *
- * -------------------------------------------------------------------------
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
  */
 package com.fortrow.jflux.stdout;
 
@@ -202,6 +208,37 @@ public final class Terminal {
         if (choices == null || choices.isEmpty()) throw ExceptionHandling.invalid("At least one terminal choice is required.");
         List<String> labels = choices.stream().map(String::valueOf).toList();
         return choices.get(select(label, labels));
+    }
+
+    public Terminal box(com.fortrow.jflux.stdout.tui.TerminalBox box) {
+        if (box != null) {
+            box.render(out);
+        }
+        return this;
+    }
+
+    public Terminal box(String title, List<String> lines) {
+        com.fortrow.jflux.stdout.tui.TerminalBox.create()
+                .title(title)
+                .addLines(lines)
+                .render(out);
+        return this;
+    }
+
+    public Terminal diff(String rawDiff) {
+        out.print(com.fortrow.jflux.stdout.tui.DiffHighlighter.highlight(rawDiff));
+        return this;
+    }
+
+    public com.fortrow.jflux.stdout.tui.TerminalSpinner spinner() {
+        return new com.fortrow.jflux.stdout.tui.TerminalSpinner(out);
+    }
+
+    public String ryelPrompt(String label, String defaultValue) {
+        String promptLabel = com.fortrow.jflux.stdout.tui.AnsiStyle.mint("❯ ") +
+                (label == null ? "" : com.fortrow.jflux.stdout.tui.AnsiStyle.bold(label)) +
+                (defaultValue != null && !defaultValue.isEmpty() ? " " + com.fortrow.jflux.stdout.tui.AnsiStyle.dim("[" + defaultValue + "]") : "") + " ";
+        return prompt(promptLabel, defaultValue);
     }
 
     private String readLine() {

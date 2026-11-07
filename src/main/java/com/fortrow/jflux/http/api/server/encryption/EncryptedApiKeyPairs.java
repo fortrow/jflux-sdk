@@ -1,23 +1,26 @@
 /*
- * -------------------------------------------------------------------------
- * 
- * Copyright (c) 2026 Fortrow LLC. All rights reserved.
- *  
- * NOTICE: All information contained herein is, and remains the property of 
- * Fortrow, LLC. The intellectual and technical concepts contained herein are 
- * proprietary to [Company Name] and may be covered by U.S. and Foreign Patents, 
- * patents in process, and are protected by trade secret or copyright law.
- * 
- * Dissemination of this information or reproduction of this material is 
- * strictly forbidden unless prior written permission is obtained from 
- * Fortrow, LLC.
- * 
- * -------------------------------------------------------------------------
- * 
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ *
  * File created by Ryan Fitzgerald (ryan@fortrow.com) on 2026-05-08 17:12:47 EDT
- * 
- * -------------------------------------------------------------------------
-
  */
 package com.fortrow.jflux.http.api.server.encryption;
 
@@ -38,7 +41,43 @@ public class EncryptedApiKeyPairs {
 
     private String keySetId;
 
+    private EncryptedApiCryptoSuite suite = EncryptedApiCryptoSuite.RSA_2048;
+
+    /** Uses a client-owned public key; the corresponding private key never reaches the server. */
+    public EncryptedApiKeyPairs(String apiSecret, EncryptedApiCryptoSuite suite, byte[] clientPublicKey) {
+        if (suite == null) throw com.fortrow.jflux.exceptions.ExceptionHandling.invalid("Encrypted API crypto suite is required.");
+        if (clientPublicKey == null && suite == EncryptedApiCryptoSuite.RSA_2048) {
+            initializeLegacy(apiSecret);
+            return;
+        }
+        this.suite = suite;
+        this.clientPublic = new AsymmetricKey(suite.publicKey(clientPublicKey), apiSecret);
+        byte[][] serverKeys = suite.generateKeyPair();
+        try {
+            this.serverPublic = new AsymmetricKey(suite.publicKey(serverKeys[0]), apiSecret);
+            this.serverPrivate = new AsymmetricKey(suite.privateKey(serverKeys[1]), apiSecret);
+        } finally {
+            java.util.Arrays.fill(serverKeys[1], (byte) 0);
+        }
+        this.keySetId = com.fortrow.jflux.encoding.Hex.getHex(com.fortrow.jflux.crypto.Rand.secure(32));
+    }
+
+    public EncryptedApiCryptoSuite getSuite() { return suite; }
+
+    /** Erases keys held by this endpoint when the session ends. */
+    public void destroy() {
+        if (clientPrivate != null) clientPrivate.clearKeys();
+        if (serverPrivate != null) serverPrivate.clearKeys();
+        if (clientPublic != null) clientPublic.clearKeys();
+        if (serverPublic != null) serverPublic.clearKeys();
+    }
+
     public EncryptedApiKeyPairs(String apiSecret) {
+
+        initializeLegacy(apiSecret);
+    }
+
+    private void initializeLegacy(String apiSecret) {
 
         KeyPair[] keyPairs = getKeyPairs();
         clientPublic = new AsymmetricKey(keyPairs[0].getPublic(), apiSecret);
@@ -56,7 +95,7 @@ public class EncryptedApiKeyPairs {
 
     public void clear() {
 
-        clientPrivate.clearKeys();
+        if (clientPrivate != null) clientPrivate.clearKeys();
         serverPublic.clearKeys();
 
     }
@@ -141,6 +180,10 @@ public class EncryptedApiKeyPairs {
         }
 
         public void clearKeys() {
+            if (this.privateKey != null) {
+                try { this.privateKey.destroy(); }
+                catch (javax.security.auth.DestroyFailedException ignored) { }
+            }
             this.publicKey = null;
             this.privateKey = null;
             this.privateKeyId = "";

@@ -1,3 +1,26 @@
+/*
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ */
+
 package com.fortrow.jflux.http.api.server.session;
 
 import org.junit.jupiter.api.Test;
@@ -10,6 +33,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 class SessionResumeTokenStoreTest {
+
+    @Test void hashedAdministrativeRevocationPersistsAndPreservesOtherSessions() throws Throwable {
+        Path path=Files.createTempDirectory("jflux-revoke-test").resolve("tokens.json");
+        SessionResumeTokenStore store=new SessionResumeTokenStore(path);
+        String first=store.issue("api","secret","first",Duration.ofMinutes(5));
+        String second=store.issue("api","secret","second",Duration.ofMinutes(5));
+        String other=store.issue("other","secret","first",Duration.ofMinutes(5));
+        store.invalidateForSessionHash(com.fortrow.jflux.crypto.builtin.SHA.get256("api"),"first");
+        SessionResumeTokenStore reopened=new SessionResumeTokenStore(path);
+        assertEquals(null,reopened.sessionForToken("api","secret",first));
+        assertEquals("second",reopened.sessionForToken("api","secret",second));
+        assertEquals("first",reopened.sessionForToken("other","secret",other));
+    }
 
     @Test
     void earlyTokensRefreshWithoutReservingAnotherLiveSlot() throws Throwable {

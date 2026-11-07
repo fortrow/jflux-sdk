@@ -1,3 +1,26 @@
+/*
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ */
+
 package com.fortrow.jflux.http.api.server.session;
 
 import com.fortrow.jflux.crypto.Rand;
@@ -194,6 +217,14 @@ public final class SessionResumeTokenStore {
 
     public synchronized void invalidateForSession(String apiKey, String sessionId) throws APIException {
         entries.removeIf(entry -> entry.apiKeyHash().equals(hash(apiKey)) && entry.sessionId().equals(sessionId));
+        persist();
+    }
+
+    /** Administrative exact-scope revocation without exposing root API-key material. */
+    public synchronized void invalidateForSessionHash(String apiKeyHash, String sessionId) throws APIException {
+        if (apiKeyHash == null || !apiKeyHash.matches("[a-f0-9]{64}") || sessionId == null || sessionId.isBlank())
+            throw new APIException("Exact session revocation scope required.");
+        entries.removeIf(entry -> entry.apiKeyHash().equals(apiKeyHash) && entry.sessionId().equals(sessionId));
         persist();
     }
 

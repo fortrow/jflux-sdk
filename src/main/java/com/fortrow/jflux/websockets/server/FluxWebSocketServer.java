@@ -1,3 +1,26 @@
+/*
+ * Copyright (c) 2026 Fortrow LLC.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Fortrow-Commercial
+ *
+ * JFlux is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation.
+ *
+ * JFlux is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with JFlux. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Alternatively, a separate commercial license is available from Fortrow LLC.
+ * For terms permitting use without the AGPL copyleft requirements, contact
+ * ryan@fortrow.com. Commercial rights require a separate written agreement.
+ * See LICENSE and COMMERCIAL-LICENSE.md.
+ */
+
 package com.fortrow.jflux.websockets.server;
 
 import com.fortrow.jflux.exceptions.ExceptionHandling;
@@ -50,6 +73,7 @@ public class FluxWebSocketServer extends WebSocketServer implements AutoCloseabl
         if (parserLimitBytes < 1) throw ExceptionHandling.invalid("Parser message limit must be positive.");
         this.maxMessageBytes = parserLimitBytes;
         this.handler = handler == null ? new FluxWebSocketHandler() { } : handler;
+        setReuseAddr(true);
     }
 
     public FluxWebSocketServer(String host, int port, FluxWebSocketHandler handler, SSLContext sslContext)
@@ -138,7 +162,7 @@ public class FluxWebSocketServer extends WebSocketServer implements AutoCloseabl
 
     @Override
     public void onError(WebSocket webSocket, Exception error) {
-        FluxWebSocketSession session = sessions.get(webSocket);
+        FluxWebSocketSession session = webSocket == null ? null : sessions.get(webSocket);
         ExceptionHandling.report(error);
         if (session != null) dispatch(() -> handler.onError(session, error), session);
     }
